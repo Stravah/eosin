@@ -4,11 +4,12 @@
 
 ## Why the Name Eosin?
 
-In biology, *eosin* is a dye that helps differentiate cells under a microscope. In a similar way, this package is designed to differentiate and extract data from the messy structures of bank statements. While creating a parser for a single, specific statement format is easy, Eosin is built to handle the hardest version of the problem—working with all kinds of inconsistent formats and messy data.
+In biology, _eosin_ is a dye that helps differentiate cells under a microscope. In a similar way, this package is designed to differentiate and extract data from the messy structures of bank statements. While creating a parser for a single, specific statement format is easy, Eosin is built to handle the hardest version of the problem—working with all kinds of inconsistent formats and messy data.
 
 ### What Makes Bank Statements So Hard to Parse?
 
 Bank statements are notorious for being a nightmare to automate due to:
+
 1. **Inconsistent Headers**: Each statement has its own unique headers, which can even change across pages.
 2. **Cell Size Variations**: Adjacent cells aren’t always the same size.
 3. **Irregular Rows and Columns**: Rows and columns often don’t follow consistent heights and widths.
@@ -26,7 +27,18 @@ Bank statements are notorious for being a nightmare to automate due to:
 ### The Assumptions We Make
 
 To manage all these headaches, we made a few assumptions:
+
 - **Dates Are Key**: We treat the date header as the most reliable thing on the page. We use it to figure out the structure of the table and align everything else around it.
 - **Smart Date Parsing**: Eosin will try to pull together broken or spread-out dates and align them. If it still doesn’t make sense, we’ll ignore it and move on.
 - **Headers Don’t Overlap**: We assume headers don’t interfere with each other, making them useful to anchor the rest of the data.
 - **Spacing is Reasonably Consistent Across Pages**: While row and column spacing might be all over the place on one page, we assume it doesn’t change too wildly across the different pages.
+
+### Known Issues and TODOs
+
+- Last row of the table is clipped out intentionally currently for testing purposes.
+- The date parser library is quite slow and also accepts incorrect dates sometimes (for example '01/01/2024 d' is accepted as valid)
+- The parser currently does not differentiate between dates that are top aligned, center aligned, or bottom aligned.
+- Padding between the date header and adjacent headers isn't calculated correctly, currently we assume a fixed padding.
+- Whenever we need to search for a certain word/property within a word, we currently iterate over every word in the document. Should implement a hashmap type structure for this.
+- Only the first page of the document is parsed currently for testing purposes.
+- The parser currently does not differentiate between different types of transactions (credit, debit, etc.) within the text itself (for example '15CR' or '15DR')
