@@ -2,16 +2,33 @@ import pandas as pd
 import pdfplumber
 from eosin.utils import combine_text_objects, group_adjacent_text, is_valid_date
 
+DESIRABLE_HEADERS = [
+    "deposit",
+    "withdrawal",
+    "credit",
+    "detail",
+    "particular",
+    "reference",
+    "chq",
+    "cheque",
+    "narration",
+]
+
 
 class Parser:
-    def __init__(self, statement):
-        self.statement = statement
-        self.headers = []
-        self.data = None
+    def __init__(self, statement: str):
+        self.statement: str = statement
+        self.headers: list[str] = []
+        self.data: pd.DataFrame | None = None
+        self.pdf_object: pdfplumber.Page | None = None
+        self.words_list: list[dict] | None = None
+        self.table_date: dict | None = None
+        self.date_column_dimensions: tuple[int, int] | None = None
+        self.date_rows: list[dict] | None = None
 
-    def parse(self):
+    def parse(self) -> pd.DataFrame:
         with pdfplumber.open(self.statement) as pdf:
-            pdf_objects = pdf.pages[0]
+            pdf_objects: pdfplumber.Page = pdf.pages[0]
             self.pdf_object = pdf_objects
             self._get_words()
             self._find_date_header()
@@ -19,15 +36,17 @@ class Parser:
             self._parse_dates_top_aligned()
             return self.data
 
-    def _get_words(self):
-        words_list = self.pdf_object.extract_words()
-        for index in range(len(words_list)):
-            words_list[index]["index"] = index
+    def _get_words(self) -> list[dict]:
+        words_list: list[dict] = self.pdf_object.extract_words()
+        for index, word in enumerate(words_list):
+            word["index"] = index
 
         self.words_list = words_list
 
-    def _find_nearby_headers(self, text_date_object, top_padding=15, bottom_padding=10):
-        words_list = self.words_list
+    def _find_nearby_headers(
+        self, text_date_object: dict, top_padding: int = 15, bottom_padding: int = 10
+    ) -> list[dict]:
+        words_list: list[dict] = self.words_list
 
         potential_headers = []
 
@@ -43,17 +62,7 @@ class Parser:
         return potential_headers
 
     def _is_table_date(self, date):
-        DESIRABLE_HEADERS = [
-            "deposit",
-            "withdrawal",
-            "credit",
-            "detail",
-            "particular",
-            "reference",
-            "chq",
-            "cheque",
-            "narration",
-        ]
+
         nearby_headers = self._find_nearby_headers(date)
 
         for nearby_header in nearby_headers:
@@ -62,11 +71,10 @@ class Parser:
                 for desirable_header in DESIRABLE_HEADERS
             ):
                 return True
-        else:
-            return False
+        return False
 
     # TODO: properly implement this function
-    def __find_date_header_padding(self, date_header):
+    def _find_date_header_padding(self, date_header):
         header_list = self._find_nearby_headers(date_header)
 
         horizontal_gaps = []
@@ -74,8 +82,8 @@ class Parser:
             horizontal_gaps.append(header_list[x + 1]["x0"] - header_list[x]["x1"])
 
         vertical_gaps = []
-        for x in range(len(header_list)):
-            vertical_gaps.append(header_list[x]["bottom"])
+        for index, _header in enumerate(header_list):
+            vertical_gaps.append(header_list[index]["bottom"])
 
         return [30, 30]
 
@@ -91,7 +99,7 @@ class Parser:
                     adjacent_headers = self._find_nearby_headers(table_date)
 
                     headers = group_adjacent_text(adjacent_headers, expected_gap=5)
-                    padding = self.__find_date_header_padding(table_date)
+                    padding = self._find_date_header_padding(table_date)
 
                     date_column_dimensions = (
                         table_date["x0"] - padding[0],
