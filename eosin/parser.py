@@ -43,10 +43,22 @@ class Parser:
             page_count = len(pdf.pages)
             logger.info(f"PDF has {page_count} pages")
 
-            first_page = pdf.pages[0]
-            self.pdf_object = first_page
-            self._get_words()
-            logger.info("Words extracted successfully")
+            table_start_page = -1
+            for page_num in range(page_count):
+                logger.info(f"Checking page {page_num+1} for table header")
+                page = pdf.pages[page_num]
+                self.pdf_object = page
+                self._get_words()
+
+                if self._check_for_table_headers():
+                    table_start_page = page_num
+                    logger.info(f"Found table header on page {page_num+1}")
+                    break
+
+            if table_start_page == -1:
+                logger.error("No table header found in any page of the document")
+                return pd.DataFrame()
+
             self._find_date_header()
             logger.info("Date header found successfully")
             self._find_date_rows()
@@ -56,9 +68,11 @@ class Parser:
             if page_df is not None and not page_df.empty:
                 self.all_pages_data.append(page_df)
 
-            if page_count > 1:
-                logger.info(f"Processing additional {page_count-1} pages")
-                for page_num in range(1, page_count):
+            if page_count > table_start_page + 1:
+                logger.info(
+                    f"Processing additional {page_count-(table_start_page+1)} pages"
+                )
+                for page_num in range(table_start_page + 1, page_count):
                     logger.info(f"Processing page {page_num+1}")
                     page = pdf.pages[page_num]
                     self.pdf_object = page
@@ -72,7 +86,7 @@ class Parser:
                         self._find_date_rows()
                     else:
                         logger.info(
-                            f"No table headers found on page {page_num+1}, using dimensions from first page"
+                            f"No table headers found on page {page_num+1}, using dimensions from first table page"
                         )
                         self._find_date_rows_without_headers()
 
@@ -157,19 +171,26 @@ class Parser:
         logger.info("Finding date header")
 
         words_list = self.words_list
-        for word in words_list:
-            if "date" in word["text"].lower():
-                potential_date = word
+        date_header_terms = [
+            "date",
+            "transaction date",
+            "value date",
+            "posting date",
+            "tran date",
+        ]
+        table_date = None
 
-                logger.debug(f"Potential date found: {potential_date}")
+        for word in words_list:
+            word_text = word["text"].lower()
+            if any(term in word_text for term in date_header_terms):
+                potential_date = word
+                logger.debug(f"Potential date header found: {potential_date}")
 
                 if self._is_table_date(potential_date):
                     table_date = potential_date
-
-                    logger.debug(f"Table date found: {table_date}")
+                    logger.debug(f"Table date header found: {table_date}")
 
                     adjacent_headers = self._find_nearby_headers(table_date)
-
                     headers = group_adjacent_text(adjacent_headers, expected_gap=5)
                     padding = self._find_date_header_padding(table_date)
 
@@ -183,9 +204,49 @@ class Parser:
                     self.table_date = table_date
                     self.date_column_dimensions = date_column_dimensions
                     self.headers = headers
-                    break
-        else:
-            raise Exception("Date header not found")
+                    return
+
+        if not table_date:
+            rows = {}
+            for word in words_list:
+                row_key = round(word["top"] / 5) * 5
+                if row_key not in rows:
+                    rows[row_key] = []
+                rows[row_key].append(word)
+
+            for row_key, row_words in sorted(rows.items()):
+                header_words = []
+                for word in row_words:
+                    word_text = word["text"].lower()
+                    if any(
+                        header in word_text
+                        for header in DESIRABLE_HEADERS + ["date", "balance"]
+                    ):
+                        header_words.append(word)
+
+                if len(header_words) >= 3:
+                    header_words.sort(key=lambda x: x["x0"])
+
+                    leftmost_header = header_words[0]
+
+                    padding = [30, 30]
+                    date_column_dimensions = (
+                        leftmost_header["x0"] - padding[0],
+                        leftmost_header["x1"] + padding[1],
+                    )
+
+                    logger.debug(
+                        f"Inferred date column dimensions: {date_column_dimensions}"
+                    )
+
+                    headers = group_adjacent_text(header_words, expected_gap=5)
+
+                    self.table_date = leftmost_header
+                    self.date_column_dimensions = date_column_dimensions
+                    self.headers = headers
+                    return
+
+        raise Exception("Date header not found")
 
     # TODO: Refactor this monstrosity of a method
     def _find_date_rows(self):
@@ -399,6 +460,14 @@ class Parser:
         for i in range(len(dates) - 1):
             gaps_between_rows.append(dates[i + 1]["top"] - dates[i]["bottom"])
 
+        # Add an estimated gap for the last row based on average gap or use a default value
+        if gaps_between_rows:
+            avg_gap = sum(gaps_between_rows) / len(gaps_between_rows)
+            gaps_between_rows.append(avg_gap)
+        else:
+            # If there's only one date and no gaps to calculate, use a reasonable default
+            gaps_between_rows.append(20)
+
         logger.debug(f"Gaps between rows: {gaps_between_rows}")
 
         logger.debug("Parsing rows")
@@ -413,12 +482,19 @@ class Parser:
             if self.headers:
                 column_positions = [(h["x0"], h["x1"]) for h in self.headers]
 
-        for i in range(len(dates) - 1):
+        for i in range(len(dates)):
             date_text = dates[i]["text"]
 
             potential_headers = [dates[i]]
             top = dates[i]["top"] - 2
-            bottom = dates[i]["bottom"] + gaps_between_rows[i] + 2
+
+            if i < len(dates) - 1:
+                bottom = dates[i]["bottom"] + gaps_between_rows[i] + 2
+            else:
+                page_height = (
+                    max([word["bottom"] for word in words_list]) if words_list else 800
+                )
+                bottom = min(dates[i]["bottom"] + gaps_between_rows[i] + 2, page_height)
 
             row_text_elements = []
             for j in range(len(words_list)):
@@ -452,7 +528,6 @@ class Parser:
                     else:
                         table[ctext].append(categorized_text[ctext])
             else:
-
                 row_elements = sorted(grouped_row_text, key=lambda x: x["x0"])
 
                 row_data = {}
@@ -517,12 +592,50 @@ class Parser:
     def _check_for_table_headers(self) -> bool:
         logger.info("Checking for table headers on current page")
 
+        header_terms = [
+            "date",
+            "transaction date",
+            "value date",
+            "description",
+            "narration",
+            "particulars",
+            "details",
+            "chq/ref no",
+            "cheque",
+            "withdrawal",
+            "debit",
+            "credit",
+            "deposit",
+            "amount",
+            "balance",
+        ]
+
         words_list = self.words_list
+
+        rows = {}
         for word in words_list:
-            if "date" in word["text"].lower():
-                potential_date = word
-                if self._is_table_date(potential_date):
-                    return True
+            row_key = round(word["top"] / 5) * 5
+            if row_key not in rows:
+                rows[row_key] = []
+            rows[row_key].append(word)
+
+        for row_key, row_words in rows.items():
+            header_matches = 0
+            for word in row_words:
+                word_text = word["text"].lower()
+                if any(term in word_text for term in header_terms):
+                    header_matches += 1
+                    # Check specifically for date header with typical statement columns
+                    if "date" in word_text:
+                        potential_date = word
+                        if self._is_table_date(potential_date):
+                            logger.debug(f"Found table date header: {word['text']}")
+                            return True
+
+            if header_matches >= 3:
+                logger.debug(f"Found header row with {header_matches} header terms")
+                return True
+
         return False
 
     def _detect_end_of_table(self) -> bool:
