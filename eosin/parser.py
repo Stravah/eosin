@@ -3,7 +3,9 @@ import pandas as pd
 import pdfplumber
 from eosin.utils import combine_text_objects, group_adjacent_text, is_valid_date
 
-logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.WARNING, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -32,7 +34,6 @@ class Parser:
         self.table_date: dict | None = None
         self.date_column_dimensions: tuple[int, int] | None = None
         self.date_rows: list[dict] | None = None
-        # New attributes for multi-page parsing
         self.last_row_bottom: float | None = None
         self.all_pages_data: list[pd.DataFrame] = []
 
@@ -41,8 +42,7 @@ class Parser:
         with pdfplumber.open(self.statement) as pdf:
             page_count = len(pdf.pages)
             logger.info(f"PDF has {page_count} pages")
-            
-            # Parse first page to find table structure
+
             first_page = pdf.pages[0]
             self.pdf_object = first_page
             self._get_words()
@@ -51,13 +51,11 @@ class Parser:
             logger.info("Date header found successfully")
             self._find_date_rows()
             logger.info("Date rows identified successfully")
-            
-            # Parse first page and store table data
+
             page_df = self._parse_dates_top_aligned()
             if page_df is not None and not page_df.empty:
                 self.all_pages_data.append(page_df)
-            
-            # Process additional pages
+
             if page_count > 1:
                 logger.info(f"Processing additional {page_count-1} pages")
                 for page_num in range(1, page_count):
@@ -65,37 +63,36 @@ class Parser:
                     page = pdf.pages[page_num]
                     self.pdf_object = page
                     self._get_words()
-                    
-                    # Check if this page has table headers
+
                     has_headers = self._check_for_table_headers()
-                    
+
                     if has_headers:
                         logger.info(f"Found table headers on page {page_num+1}")
                         self._find_date_header()
                         self._find_date_rows()
                     else:
-                        logger.info(f"No table headers found on page {page_num+1}, using dimensions from first page")
+                        logger.info(
+                            f"No table headers found on page {page_num+1}, using dimensions from first page"
+                        )
                         self._find_date_rows_without_headers()
-                    
-                    # Check if we have rows to parse
+
                     if self.date_rows and len(self.date_rows) > 0:
-                        # Parse and store page data
                         page_df = self._parse_dates_top_aligned()
                         if page_df is not None and not page_df.empty:
                             self.all_pages_data.append(page_df)
-                    
-                    # Check if we've reached the end of the table
+
                     if self._detect_end_of_table():
                         logger.info(f"End of table detected on page {page_num+1}")
                         break
-            
-            # Combine all dataframes
+
             if self.all_pages_data:
                 self.data = pd.concat(self.all_pages_data, ignore_index=True)
-                logger.info(f"Successfully parsed {len(self.all_pages_data)} pages with {len(self.data)} total rows")
+                logger.info(
+                    f"Successfully parsed {len(self.all_pages_data)} pages with {len(self.data)} total rows"
+                )
             else:
                 logger.warning("No data was extracted from the PDF")
-                
+
         return self.data
 
     def _get_words(self) -> list[dict]:
@@ -211,7 +208,9 @@ class Parser:
             ):
                 potential_dates.append(words_list[i])
 
-        logger.debug(f"Potential dates found: {[potential_date['text'] for potential_date in potential_dates]}")
+        logger.debug(
+            f"Potential dates found: {[potential_date['text'] for potential_date in potential_dates]}"
+        )
 
         dates = []
         i = 0
@@ -294,133 +293,36 @@ class Parser:
         logger.debug(f"Categorized text: {categorized_text}")
         return categorized_text
 
-    def _parse_dates_top_aligned(self):
-        logger.debug("Parsing dates assuming top alignment")
-
-        dates = self.date_rows
-        words_list = self.words_list
-        
-        if not dates or len(dates) <= 1:
-            logger.warning("Insufficient date rows found for parsing")
-            return None
-            
-        # Store table information for continuity between pages
-        if self.table_date:
-            table_date_index = self.table_date["index"]
-        else:
-            # If no table header on this page, use first word as reference
-            table_date_index = 0
-
-        gaps_between_rows = []
-        table = {}
-
-        logger.debug("Calculating gaps between rows")
-        for i in range(len(dates) - 1):
-            gaps_between_rows.append(dates[i + 1]["top"] - dates[i]["bottom"])
-
-        logger.debug(f"Gaps between rows: {gaps_between_rows}")
-
-        logger.debug("Parsing rows")
-        if self.headers:
-            logger.debug(f"Row headers: {[header['text'] for header in self.headers]}")
-        
-        for i in range(len(dates) - 1):
-            potential_headers = [dates[i]]
-            top = dates[i]["top"] - 2
-            bottom = dates[i]["bottom"] + gaps_between_rows[i] + 2
-
-            for j in range(table_date_index, len(words_list)):
-                if (
-                    words_list[j]["top"] > top
-                    and words_list[j]["bottom"] < bottom
-                    and words_list[j]["x0"] > dates[i]["x0"]
-                ):
-                    potential_headers.append(words_list[j])
-
-            grouped_row_text = group_adjacent_text(potential_headers)
-            
-            if self.headers:
-                categorized_text = self._categorize_text_into_headers(grouped_row_text)
-                for ctext in categorized_text:
-                    if ctext not in table:
-                        table[ctext] = [categorized_text[ctext]]
-                    else:
-                        table[ctext].append(categorized_text[ctext])
-            else:
-                # Handle case where there are no headers (continuations from previous page)
-                # Just create columns based on x-position
-                sorted_text = sorted(grouped_row_text, key=lambda x: x["x0"])
-                row_data = [item["text"] for item in sorted_text]
-                
-                # If there's data from first page, use those column names
-                if self.all_pages_data and not self.all_pages_data[0].empty:
-                    columns = list(self.all_pages_data[0].columns)
-                    # Fill data into existing columns
-                    for idx, text in enumerate(row_data):
-                        if idx < len(columns):
-                            col_name = columns[idx]
-                            if col_name not in table:
-                                table[col_name] = [text]
-                            else:
-                                table[col_name].append(text)
-                else:
-                    # Create generic column names
-                    for idx, text in enumerate(row_data):
-                        col_name = f"Column_{idx}"
-                        if col_name not in table:
-                            table[col_name] = [text]
-                        else:
-                            table[col_name].append(text)
-        
-        # Store position of last row for continuity detection
-        if dates and len(dates) > 0:
-            self.last_row_bottom = max(date["bottom"] for date in dates)
-            
-        if table:
-            df = pd.DataFrame(table)
-            return df
-        else:
-            return None
-
-    def _check_for_table_headers(self) -> bool:
-        """Check if the current page has table headers by looking for 'date' text"""
-        logger.info("Checking for table headers on current page")
-        
-        words_list = self.words_list
-        for word in words_list:
-            if "date" in word["text"].lower():
-                potential_date = word
-                if self._is_table_date(potential_date):
-                    return True
-        return False
-
     def _find_date_rows_without_headers(self):
         """Find date rows on pages without headers using dimensions from first page"""
         logger.info("Finding date rows without headers")
-        
+
         if not self.date_column_dimensions:
             logger.error("No date column dimensions available from first page")
             return
-            
+
         words_list = self.words_list
         date_column_dimensions = self.date_column_dimensions
-        
+
         potential_dates = []
-        
-        # Find all words that fall within the date column dimensions from first page
+
         for i, word in enumerate(words_list):
+            word["index"] = i
             if (
                 word["x0"] > date_column_dimensions[0]
                 and word["x1"] < date_column_dimensions[1]
             ):
                 potential_dates.append(word)
-        
-        logger.debug(f"Potential dates found: {[potential_date['text'] for potential_date in potential_dates]}")
-        
-        # Same date validation logic as in _find_date_rows
+
+        potential_dates.sort(key=lambda x: x["top"])
+
+        logger.debug(
+            f"Potential dates found: {[potential_date['text'] for potential_date in potential_dates]}"
+        )
+
         dates = []
         i = 0
-        
+
         while i < len(potential_dates):
             match is_valid_date(potential_dates[i]["text"]):
                 case "Valid":
@@ -470,43 +372,196 @@ class Parser:
                 case "Invalid":
                     pass
             i += 1
-        
+
+        dates.sort(key=lambda x: x["top"])
         logger.debug(f"Dates found without headers: {[date['text'] for date in dates]}")
         self.date_rows = dates
 
-    def _detect_end_of_table(self) -> bool:
-        """
-        Detect if we've reached the end of the table by checking for significant gaps
-        or specific ending text patterns like "Closing Balance", "Total", etc.
-        """
-        if not self.date_rows or len(self.date_rows) == 0:
-            # No date rows found on this page, could indicate end of table
-            return True
-            
-        # Check for ending keywords typically found at the end of bank statements
-        ending_keywords = ["closing balance", "total", "balance c/f", "balance b/f", "grand total", "end of statement"]
+    def _parse_dates_top_aligned(self):
+        logger.debug("Parsing dates assuming top alignment")
+
+        dates = self.date_rows
         words_list = self.words_list
-        
-        # Find the bottom of the last date row
+
+        if not dates or len(dates) <= 1:
+            logger.warning("Insufficient date rows found for parsing")
+            return None
+
+        if self.table_date:
+            table_date_index = self.table_date["index"]
+        else:
+            table_date_index = 0
+
+        gaps_between_rows = []
+        table = {}
+
+        logger.debug("Calculating gaps between rows")
+        for i in range(len(dates) - 1):
+            gaps_between_rows.append(dates[i + 1]["top"] - dates[i]["bottom"])
+
+        logger.debug(f"Gaps between rows: {gaps_between_rows}")
+
+        logger.debug("Parsing rows")
+        if self.headers:
+            logger.debug(f"Row headers: {[header['text'] for header in self.headers]}")
+
+        first_page_columns = []
+        column_positions = []
+        if self.all_pages_data and not self.all_pages_data[0].empty:
+            first_page_columns = list(self.all_pages_data[0].columns)
+
+            if self.headers:
+                column_positions = [(h["x0"], h["x1"]) for h in self.headers]
+
+        for i in range(len(dates) - 1):
+            date_text = dates[i]["text"]
+
+            potential_headers = [dates[i]]
+            top = dates[i]["top"] - 2
+            bottom = dates[i]["bottom"] + gaps_between_rows[i] + 2
+
+            row_text_elements = []
+            for j in range(len(words_list)):
+                if (
+                    words_list[j]["top"] > top
+                    and words_list[j]["bottom"] < bottom
+                    and words_list[j]["x0"] > dates[i]["x0"]
+                ):
+                    row_text_elements.append(words_list[j])
+
+            grouped_row_text = group_adjacent_text(
+                potential_headers + row_text_elements
+            )
+
+            if grouped_row_text and grouped_row_text[0]["x0"] <= dates[i]["x1"]:
+                grouped_row_text = grouped_row_text[1:]
+
+            if self.headers:
+                categorized_text = self._categorize_text_into_headers(grouped_row_text)
+
+                if len(table) == 0 and "Date" not in categorized_text:
+                    table["Date"] = []
+
+                if "Date" in table and "Date" not in categorized_text:
+                    if len(table["Date"]) < len(list(table.values())[0]) + 1:
+                        table["Date"].append(date_text)
+
+                for ctext in categorized_text:
+                    if ctext not in table:
+                        table[ctext] = [categorized_text[ctext]]
+                    else:
+                        table[ctext].append(categorized_text[ctext])
+            else:
+
+                row_elements = sorted(grouped_row_text, key=lambda x: x["x0"])
+
+                row_data = {}
+
+                if first_page_columns:
+                    date_column = first_page_columns[0]
+                    row_data[date_column] = date_text
+
+                if column_positions:
+                    for elem in row_elements:
+                        for idx, (col_x0, col_x1) in enumerate(column_positions):
+                            if idx > 0 and (
+                                (
+                                    elem["x0"] >= col_x0 - 20
+                                    and elem["x0"] <= col_x1 + 20
+                                )
+                                or (
+                                    elem["x1"] >= col_x0 - 20
+                                    and elem["x1"] <= col_x1 + 20
+                                )
+                                or (elem["x0"] <= col_x0 and elem["x1"] >= col_x1)
+                            ):
+                                if idx < len(first_page_columns):
+                                    col_name = first_page_columns[idx]
+                                    if col_name in row_data:
+                                        row_data[col_name] += " " + elem["text"]
+                                    else:
+                                        row_data[col_name] = elem["text"]
+                                break
+                else:
+                    start_idx = 0 if date_column not in row_data else 1
+                    for idx, elem in enumerate(row_elements):
+                        col_idx = idx + start_idx
+                        if col_idx < len(first_page_columns):
+                            col_name = first_page_columns[col_idx]
+                            if col_name != date_column:
+                                if col_name in row_data:
+                                    row_data[col_name] += " " + elem["text"]
+                                else:
+                                    row_data[col_name] = elem["text"]
+
+                for col in first_page_columns:
+                    if col not in table:
+                        table[col] = [row_data.get(col, "")]
+                    else:
+                        table[col].append(row_data.get(col, ""))
+
+        if dates and len(dates) > 0:
+            self.last_row_bottom = max(date["bottom"] for date in dates)
+
+        if table:
+            max_length = max(len(values) for values in table.values())
+            for col in table:
+                if len(table[col]) < max_length:
+                    table[col].extend([""] * (max_length - len(table[col])))
+
+            df = pd.DataFrame(table)
+            return df
+        else:
+            return None
+
+    def _check_for_table_headers(self) -> bool:
+        logger.info("Checking for table headers on current page")
+
+        words_list = self.words_list
+        for word in words_list:
+            if "date" in word["text"].lower():
+                potential_date = word
+                if self._is_table_date(potential_date):
+                    return True
+        return False
+
+    def _detect_end_of_table(self) -> bool:
+
+        if not self.date_rows or len(self.date_rows) == 0:
+            return True
+
+        ending_keywords = [
+            "closing balance",
+            "total",
+            "balance c/f",
+            "balance b/f",
+            "grand total",
+            "end of statement",
+        ]
+        words_list = self.words_list
+
         if self.date_rows:
             last_date_bottom = max(date["bottom"] for date in self.date_rows)
-            
-            # Look for ending keywords below the last date row
+
             for word in words_list:
-                if word["top"] > last_date_bottom and any(keyword in word["text"].lower() for keyword in ending_keywords):
+                if word["top"] > last_date_bottom and any(
+                    keyword in word["text"].lower() for keyword in ending_keywords
+                ):
                     logger.debug(f"Found ending keyword: {word['text']}")
                     return True
-            
-            # Check for large gap between dates (might indicate end of data)
+
             if self.last_row_bottom is not None:
-                # If the first date on this page is significantly below where we'd expect,
-                # it could indicate end of meaningful table data
                 first_date_top = min(date["top"] for date in self.date_rows)
-                if first_date_top > 100:  # Arbitrary threshold - adjust based on your PDFs
-                    logger.debug(f"Large gap detected before first date: {first_date_top}")
-                    # Look at content in this gap - if it's substantial, likely end of table
-                    content_in_gap = [w for w in words_list if w["top"] < first_date_top and w["bottom"] > 50]
-                    if len(content_in_gap) > 5:  # If there's substantial content before dates
+                if first_date_top > 100:
+                    logger.debug(
+                        f"Large gap detected before first date: {first_date_top}"
+                    )
+                    content_in_gap = [
+                        w
+                        for w in words_list
+                        if w["top"] < first_date_top and w["bottom"] > 50
+                    ]
+                    if len(content_in_gap) > 5:
                         return True
-            
+
         return False
