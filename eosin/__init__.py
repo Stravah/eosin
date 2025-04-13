@@ -1,5 +1,3 @@
-__all__ = [
-    "parser",
-]
+import eosin.parser
 
-import parser
+__all__ = ["parser"]
