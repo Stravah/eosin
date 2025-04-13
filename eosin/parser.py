@@ -148,6 +148,7 @@ class Parser:
                 logger.debug(f"Found desirable date: {date}")
                 return True
         return False
+        return False
 
     # TODO: properly implement this function
     def _find_date_header_padding(self, date_header):
