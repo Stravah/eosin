@@ -21,6 +21,8 @@ DESIRABLE_HEADERS = [
     "chq",
     "cheque",
     "narration",
+    "remarks",
+    "balance",
 ]
 
 
