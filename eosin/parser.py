@@ -733,11 +733,83 @@ class Parser:
                         table[col][i] = re.sub(r'\s*page\s+\d+\s+of\s+\d+\s*', '', table[col][i], flags=re.IGNORECASE)
                         # Trim any resulting whitespace
                         table[col][i] = table[col][i].strip()
+            
+            # Fix merged numbers in debit/credit and balance columns
+            self._fix_merged_numbers(table)
 
             df = pd.DataFrame(table)
             return df
         else:
             return None
+            
+    def _fix_merged_numbers(self, table):
+        """Separate merged numbers in amount and balance columns."""
+        logger.debug("Fixing merged numbers in amount and balance columns")
+        
+        # Identify likely amount and balance columns
+        amount_cols = []
+        balance_col = None
+        
+        for col in table:
+            col_lower = col.lower()
+            # Find balance column
+            if any(term in col_lower for term in ["balance", "closing"]):
+                balance_col = col
+            # Find debit/credit/amount columns
+            elif any(term in col_lower for term in ["debit", "credit", "withdrawal", "deposit", "amount"]):
+                amount_cols.append(col)
+        
+        if not balance_col or not amount_cols:
+            return
+            
+        logger.debug(f"Identified balance column: {balance_col}")
+        logger.debug(f"Identified amount columns: {amount_cols}")
+        
+        # Regular expression to match numbers with optional commas and decimal points
+        # This can match patterns like: 1.00, 1,000.00, 1000, etc.
+        number_pattern = re.compile(r'((?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d{1,2})?)')
+        
+        for i in range(len(table[balance_col])):
+            balance_value = table[balance_col][i]
+            if not isinstance(balance_value, str) or not balance_value:
+                continue
+                
+            # Check if there's a merged number pattern
+            matches = number_pattern.findall(balance_value)
+            if len(matches) >= 2:
+                logger.debug(f"Found potentially merged numbers: {balance_value}")
+                
+                # Try to separate the values
+                # Identify which part is the balance and which is the amount
+                for amount_col in amount_cols:
+                    if i < len(table[amount_col]) and not table[amount_col][i]:
+                        # If the amount column is empty, the first number might be the amount
+                        potential_amount = matches[0]
+                        potential_balance = matches[-1]  # Last match is likely the balance
+                        
+                        # Small amounts (like 1.00) are often merged with balance
+                        try:
+                            float_amount = float(potential_amount.replace(',', ''))
+                            if float_amount < 1000:  # Likely a small amount
+                                logger.debug(f"Fixing merged values: {potential_amount} and {potential_balance}")
+                                table[amount_col][i] = potential_amount
+                                table[balance_col][i] = potential_balance
+                                break
+                        except ValueError:
+                            continue
+                    
+                    # Special case: handle when numbers are completely merged without spaces
+                    # Typically happens with small amounts like 1.00 merged with balance like 65527.50
+                    # resulting in 1.0065527.50
+                    if not table[amount_col][i] and len(balance_value) > 10:
+                        merged_pattern = re.search(r'(\d+\.\d{2})(\d+\.\d{2})', balance_value)
+                        if merged_pattern:
+                            amount_part = merged_pattern.group(1)
+                            balance_part = merged_pattern.group(2)
+                            logger.debug(f"Splitting completely merged values: {amount_part} and {balance_part}")
+                            table[amount_col][i] = amount_part
+                            table[balance_col][i] = balance_part
+                            break
 
     def _check_for_table_headers(self) -> bool:
         logger.info("Checking for table headers on current page")
