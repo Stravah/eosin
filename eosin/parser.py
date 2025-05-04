@@ -388,42 +388,72 @@ class Parser:
         logger.debug(f"Dates found: {[date['text'] for date in dates]}")
         self.date_rows = dates
 
-    # TODO: This function is janky asf
     def _categorize_text_into_headers(self, text_objects):
-        logger.debug("Categorizing text into headers")
+        """Categorise each text object into one of the detected column headers.
+
+        This is the original, overlap-based approach that worked well for most
+        columns (Date, Value Date, Particulars, etc.).  We are restoring it to
+        avoid the recently-observed mix-ups between date and description.  The
+        small-amount / balance merge problem is now handled earlier (during row
+        token extraction) by physically splitting a merged numeric string into
+        two distinct text objects, so this routine can stay simple.
+        """
+        logger.debug("Categorizing text into headers (overlap heuristic)")
 
         headers = self.headers
-        page_number_pattern = re.compile(r"page\s+\d+\s+of\s+\d+", re.IGNORECASE)
+        if not headers:
+            return {}
 
         categorized_text = {header["text"]: "" for header in headers}
 
         for text in text_objects:
-            # Skip page numbers
-            if page_number_pattern.search(text["text"].lower()):
-                continue
-                
+            placed = False
             for header in headers:
+                # Check horizontal overlap with header bbox (+/- widths)
                 if (
                     max(header["x1"], text["x1"]) - min(header["x0"], text["x0"])
                     < header["width"] + text["width"]
                 ):
                     categorized_text[header["text"]] += text["text"]
+                    placed = True
                     break
-            else:
+            if not placed:
+                # If no overlap match, put the text in the first header that is to the right
                 for header in headers:
                     if header["x0"] > text["x0"]:
-                        categorized_text[header["text"]] = text["text"]
+                        categorized_text[header["text"]] += text["text"]
                         break
-                        
-        # Clean any page numbers that might have slipped through
-        for header_text in categorized_text:
-            categorized_text[header_text] = re.sub(r'\s*page\s+\d+\s+of\s+\d+\s*', '', 
-                                               categorized_text[header_text], 
-                                               flags=re.IGNORECASE)
-            categorized_text[header_text] = categorized_text[header_text].strip()
-            
+
+        # Trim whitespace for all values
+        for col in categorized_text:
+            categorized_text[col] = categorized_text[col].strip()
+
         logger.debug(f"Categorized text: {categorized_text}")
         return categorized_text
+
+    @staticmethod
+    def _split_merged_amount(text: str) -> tuple[str, str] | None:
+        """Detect patterns like '1.0065527.50' and split them into
+        ('1.00', '65527.50').  Returns None if the text is not a merged number."""
+        # Must have exactly two dots
+        if text.count(".") != 2:
+            return None
+        # Basic split using first dot position
+        first_dot = text.find(".")
+        if first_dot == -1 or first_dot + 3 >= len(text):
+            return None
+        first_number = text[: first_dot + 3]  # up to 2 decimal digits
+        remainder = text[first_dot + 3 :]
+        # remainder should contain another '.' separating integral and decimals
+        second_dot = remainder.find(".")
+        if second_dot == -1 or second_dot + 3 != len(remainder):
+            return None
+        second_number = remainder[: second_dot] + "." + remainder[second_dot + 1 :]
+        # Sanity: both parts should be numeric
+        num_pattern = re.compile(r"^[0-9]{1,3}(?:,[0-9]{3})*\.[0-9]{2}$|^[0-9]+\.[0-9]{2}$")
+        if num_pattern.match(first_number) and num_pattern.match(second_number):
+            return first_number, second_number
+        return None
 
     def _find_date_rows_without_headers(self):
         """Find date rows on pages without headers using dimensions from first page"""
@@ -528,15 +558,18 @@ class Parser:
         # Detect page numbers and footer elements to exclude them from row data
         page_number_pattern = re.compile(r"page\s+\d+\s+of\s+\d+", re.IGNORECASE)
         footer_elements = []
-        
+
         for word in words_list:
             # Identify page numbers
             if page_number_pattern.search(word["text"].lower()):
                 footer_elements.append(word)
                 logger.debug(f"Detected page number: {word['text']}")
-            
+
             # Identify other potential footer elements
-            if any(term in word["text"].lower() for term in ["footer", "copyright", "bank statement", "statement"]):
+            if any(
+                term in word["text"].lower()
+                for term in ["footer", "copyright", "bank statement", "statement"]
+            ):
                 footer_elements.append(word)
 
         row_boundaries = []
@@ -555,7 +588,7 @@ class Parser:
                     prev_row_height = dates[i]["bottom"] - dates[i]["top"]
                     avg_row_height = prev_row_height + 5  # Just a small padding
                     row_bottom = min(dates[i]["bottom"] + avg_row_height, page_height)
-                    
+
                     # Restrict row bottom if there are footer elements
                     if footer_elements:
                         min_footer_top = min([elem["top"] for elem in footer_elements])
@@ -591,11 +624,11 @@ class Parser:
 
                 if word["x0"] <= date["x0"]:
                     continue
-                
+
                 # Skip identified footer elements
                 if word in footer_elements:
                     continue
-                
+
                 # Skip text that likely contains page numbers
                 if page_number_pattern.search(word["text"].lower()):
                     continue
@@ -637,11 +670,16 @@ class Parser:
             for text_obj in grouped_row_text:
                 if not page_number_pattern.search(text_obj["text"].lower()):
                     filtered_row_text.append(text_obj)
-            
+
             grouped_row_text = filtered_row_text
 
             if self.headers:
                 categorized_text = self._categorize_text_into_headers(grouped_row_text)
+
+                # ---------------------------------------------------------
+                # Fix potential merged numeric strings in this single row
+                # ---------------------------------------------------------
+                categorized_text = self._fix_row_merged_numeric(categorized_text)
 
                 # Handle Date column
                 if len(table) == 0 and "Date" not in categorized_text:
@@ -670,7 +708,7 @@ class Parser:
                             # Skip page number elements
                             if page_number_pattern.search(elem["text"].lower()):
                                 continue
-                                
+
                             for idx, (col_x0, col_x1) in enumerate(column_positions):
                                 if idx > 0 and (
                                     (
@@ -697,7 +735,7 @@ class Parser:
                             # Skip page number elements
                             if page_number_pattern.search(elem["text"].lower()):
                                 continue
-                                
+
                             col_idx = idx + start_idx
                             if col_idx < len(first_page_columns):
                                 col_name = first_page_columns[col_idx]
@@ -724,92 +762,25 @@ class Parser:
             for col in table:
                 if len(table[col]) < max_length:
                     table[col].extend([""] * (max_length - len(table[col])))
-            
+
             # Clean up any remaining page numbers in the table data
             for col in table:
                 for i in range(len(table[col])):
                     if isinstance(table[col][i], str):
                         # Remove page numbers from cell values
-                        table[col][i] = re.sub(r'\s*page\s+\d+\s+of\s+\d+\s*', '', table[col][i], flags=re.IGNORECASE)
+                        table[col][i] = re.sub(
+                            r"\s*page\s+\d+\s+of\s+\d+\s*",
+                            "",
+                            table[col][i],
+                            flags=re.IGNORECASE,
+                        )
                         # Trim any resulting whitespace
                         table[col][i] = table[col][i].strip()
-            
-            # Fix merged numbers in debit/credit and balance columns
-            self._fix_merged_numbers(table)
 
             df = pd.DataFrame(table)
             return df
         else:
             return None
-            
-    def _fix_merged_numbers(self, table):
-        """Separate merged numbers in amount and balance columns."""
-        logger.debug("Fixing merged numbers in amount and balance columns")
-        
-        # Identify likely amount and balance columns
-        amount_cols = []
-        balance_col = None
-        
-        for col in table:
-            col_lower = col.lower()
-            # Find balance column
-            if any(term in col_lower for term in ["balance", "closing"]):
-                balance_col = col
-            # Find debit/credit/amount columns
-            elif any(term in col_lower for term in ["debit", "credit", "withdrawal", "deposit", "amount"]):
-                amount_cols.append(col)
-        
-        if not balance_col or not amount_cols:
-            return
-            
-        logger.debug(f"Identified balance column: {balance_col}")
-        logger.debug(f"Identified amount columns: {amount_cols}")
-        
-        # Regular expression to match numbers with optional commas and decimal points
-        # This can match patterns like: 1.00, 1,000.00, 1000, etc.
-        number_pattern = re.compile(r'((?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d{1,2})?)')
-        
-        for i in range(len(table[balance_col])):
-            balance_value = table[balance_col][i]
-            if not isinstance(balance_value, str) or not balance_value:
-                continue
-                
-            # Check if there's a merged number pattern
-            matches = number_pattern.findall(balance_value)
-            if len(matches) >= 2:
-                logger.debug(f"Found potentially merged numbers: {balance_value}")
-                
-                # Try to separate the values
-                # Identify which part is the balance and which is the amount
-                for amount_col in amount_cols:
-                    if i < len(table[amount_col]) and not table[amount_col][i]:
-                        # If the amount column is empty, the first number might be the amount
-                        potential_amount = matches[0]
-                        potential_balance = matches[-1]  # Last match is likely the balance
-                        
-                        # Small amounts (like 1.00) are often merged with balance
-                        try:
-                            float_amount = float(potential_amount.replace(',', ''))
-                            if float_amount < 1000:  # Likely a small amount
-                                logger.debug(f"Fixing merged values: {potential_amount} and {potential_balance}")
-                                table[amount_col][i] = potential_amount
-                                table[balance_col][i] = potential_balance
-                                break
-                        except ValueError:
-                            continue
-                    
-                    # Special case: handle when numbers are completely merged without spaces
-                    # Typically happens with small amounts like 1.00 merged with balance like 65527.50
-                    # resulting in 1.0065527.50
-                    if not table[amount_col][i] and len(balance_value) > 10:
-                        merged_pattern = re.search(r'(\d+\.\d{2})(\d+\.\d{2})', balance_value)
-                        if merged_pattern:
-                            amount_part = merged_pattern.group(1)
-                            balance_part = merged_pattern.group(2)
-                            logger.debug(f"Splitting completely merged values: {amount_part} and {balance_part}")
-                            table[amount_col][i] = amount_part
-                            table[balance_col][i] = balance_part
-                            break
 
     def _check_for_table_headers(self) -> bool:
         logger.info("Checking for table headers on current page")
@@ -971,3 +942,53 @@ class Parser:
 
         # By default, assume the table continues unless we have strong evidence otherwise
         return False
+
+    # -------------------------------------------------------------
+    # Helpers for numeric merge at row level (small debit amounts)
+    # -------------------------------------------------------------
+    def _fix_row_merged_numeric(self, row_dict: dict[str, str]) -> dict[str, str]:
+        """Detect and separate merged debit/credit numbers from balance within
+        a single row dictionary produced by _categorize_text_into_headers.
+
+        If the Balance column contains a string with *two* decimal points and
+        one of the primary amount columns (Withdrawals / Deposits / Debit /
+        Credit) is empty, attempt to split the merged string and populate the
+        empty amount column accordingly.
+        """
+
+        # Identify column names
+        balance_col = None
+        amount_cols: list[str] = []
+        for col in row_dict:
+            col_l = col.lower()
+            if any(k in col_l for k in ["balance", "closing"]):
+                balance_col = col
+            elif any(k in col_l for k in ["withdrawal", "withdrawals", "debit", "deposit", "credit"]):
+                amount_cols.append(col)
+
+        if not balance_col or not amount_cols:
+            return row_dict  # Nothing to do
+
+        bal_val = row_dict.get(balance_col, "")
+        if not bal_val or bal_val.count(".") != 2:
+            return row_dict  # No merge pattern
+
+        split_res = self._split_merged_amount(bal_val)
+        if not split_res:
+            return row_dict
+
+        amount_part, balance_part = split_res
+
+        # Choose first empty amount column to fill
+        target_amount_col = None
+        for ac in amount_cols:
+            if not row_dict.get(ac):
+                target_amount_col = ac
+                break
+
+        if not target_amount_col:
+            return row_dict  # All amount cols already populated
+
+        row_dict[target_amount_col] = amount_part
+        row_dict[balance_col] = balance_part
+        return row_dict
