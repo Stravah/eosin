@@ -2,7 +2,6 @@ import logging
 import pandas as pd
 import pdfplumber
 from eosin.utils import combine_text_objects, group_adjacent_text, is_valid_date
-import re
 
 logging.basicConfig(
     level=logging.WARNING, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -401,13 +400,10 @@ class Parser:
         logger.debug("Categorizing text into headers (overlap heuristic)")
 
         headers = self.headers
-        if not headers:
-            return {}
 
         categorized_text = {header["text"]: "" for header in headers}
 
         for text in text_objects:
-            placed = False
             for header in headers:
                 # Check horizontal overlap with header bbox (+/- widths)
                 if (
@@ -423,11 +419,6 @@ class Parser:
                     if header["x0"] > text["x0"]:
                         categorized_text[header["text"]] += text["text"]
                         break
-
-        # Trim whitespace for all values
-        for col in categorized_text:
-            categorized_text[col] = categorized_text[col].strip()
-
         logger.debug(f"Categorized text: {categorized_text}")
         return categorized_text
 
@@ -555,23 +546,6 @@ class Parser:
         else:
             table_date_index = 0
 
-        # Detect page numbers and footer elements to exclude them from row data
-        page_number_pattern = re.compile(r"page\s+\d+\s+of\s+\d+", re.IGNORECASE)
-        footer_elements = []
-
-        for word in words_list:
-            # Identify page numbers
-            if page_number_pattern.search(word["text"].lower()):
-                footer_elements.append(word)
-                logger.debug(f"Detected page number: {word['text']}")
-
-            # Identify other potential footer elements
-            if any(
-                term in word["text"].lower()
-                for term in ["footer", "copyright", "bank statement", "statement"]
-            ):
-                footer_elements.append(word)
-
         row_boundaries = []
         for i in range(len(dates)):
             if i < len(dates) - 1:
@@ -584,16 +558,8 @@ class Parser:
                 )
 
                 if i > 0:
-                    # For the last row, use the average row height instead of a multiplier to prevent including footer content
-                    prev_row_height = dates[i]["bottom"] - dates[i]["top"]
-                    avg_row_height = prev_row_height + 5  # Just a small padding
+                    avg_row_height = (dates[i]["bottom"] - dates[i]["top"]) * 1.5
                     row_bottom = min(dates[i]["bottom"] + avg_row_height, page_height)
-
-                    # Restrict row bottom if there are footer elements
-                    if footer_elements:
-                        min_footer_top = min([elem["top"] for elem in footer_elements])
-                        if min_footer_top > dates[i]["bottom"]:
-                            row_bottom = min(row_bottom, min_footer_top - 2)
                 else:
                     row_bottom = min(dates[i]["bottom"] + 40, page_height)
 
@@ -623,14 +589,6 @@ class Parser:
                     continue
 
                 if word["x0"] <= date["x0"]:
-                    continue
-
-                # Skip identified footer elements
-                if word in footer_elements:
-                    continue
-
-                # Skip text that likely contains page numbers
-                if page_number_pattern.search(word["text"].lower()):
                     continue
 
                 # Strategy 1: Text is fully contained within row boundaries (top alignment)
@@ -665,14 +623,6 @@ class Parser:
             if grouped_row_text and grouped_row_text[0]["x0"] <= date["x1"]:
                 grouped_row_text = grouped_row_text[1:]
 
-            # Filter out page numbers from grouped text
-            filtered_row_text = []
-            for text_obj in grouped_row_text:
-                if not page_number_pattern.search(text_obj["text"].lower()):
-                    filtered_row_text.append(text_obj)
-
-            grouped_row_text = filtered_row_text
-
             if self.headers:
                 categorized_text = self._categorize_text_into_headers(grouped_row_text)
 
@@ -705,10 +655,6 @@ class Parser:
 
                     if column_positions:
                         for elem in row_elements:
-                            # Skip page number elements
-                            if page_number_pattern.search(elem["text"].lower()):
-                                continue
-
                             for idx, (col_x0, col_x1) in enumerate(column_positions):
                                 if idx > 0 and (
                                     (
@@ -732,10 +678,6 @@ class Parser:
                         # Use horizontal position to assign columns
                         start_idx = 0 if date_column not in row_data else 1
                         for idx, elem in enumerate(row_elements):
-                            # Skip page number elements
-                            if page_number_pattern.search(elem["text"].lower()):
-                                continue
-
                             col_idx = idx + start_idx
                             if col_idx < len(first_page_columns):
                                 col_name = first_page_columns[col_idx]
@@ -762,20 +704,6 @@ class Parser:
             for col in table:
                 if len(table[col]) < max_length:
                     table[col].extend([""] * (max_length - len(table[col])))
-
-            # Clean up any remaining page numbers in the table data
-            for col in table:
-                for i in range(len(table[col])):
-                    if isinstance(table[col][i], str):
-                        # Remove page numbers from cell values
-                        table[col][i] = re.sub(
-                            r"\s*page\s+\d+\s+of\s+\d+\s*",
-                            "",
-                            table[col][i],
-                            flags=re.IGNORECASE,
-                        )
-                        # Trim any resulting whitespace
-                        table[col][i] = table[col][i].strip()
 
             df = pd.DataFrame(table)
             return df
