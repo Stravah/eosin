@@ -2,6 +2,7 @@ import logging
 import pandas as pd
 import pdfplumber
 from eosin.utils import combine_text_objects, group_adjacent_text, is_valid_date
+import re
 
 logging.basicConfig(
     level=logging.WARNING, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -404,6 +405,7 @@ class Parser:
         categorized_text = {header["text"]: "" for header in headers}
 
         for text in text_objects:
+            placed = False
             for header in headers:
                 # Check horizontal overlap with header bbox (+/- widths)
                 if (
