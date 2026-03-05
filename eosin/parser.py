@@ -85,8 +85,14 @@ class Parser:
 
                     if has_headers:
                         logger.info(f"Found table headers on page {page_num+1}")
-                        self._find_date_header()
-                        self._find_date_rows()
+                        try:
+                            self._find_date_header()
+                            self._find_date_rows()
+                        except Exception:
+                            logger.warning(
+                                f"Failed to find date header on page {page_num+1}, falling back to previous dimensions"
+                            )
+                            self._find_date_rows_without_headers()
                     else:
                         logger.info(
                             f"No table headers found on page {page_num+1}, using dimensions from first table page"
@@ -158,6 +164,54 @@ class Parser:
 
             if self.all_pages_data:
                 self.data = pd.concat(self.all_pages_data, ignore_index=True)
+
+                # Post-concat header normalization: if garbled/corrupted text
+                # created a column on one page that a subsequent page names
+                # correctly (e.g. garbled text on page 1 at the PARTICULARS
+                # position, clean PARTICULARS header on page 2+), merge them.
+                all_header_terms = set(DESIRABLE_HEADERS + [
+                    "date", "description", "mode", "value", "post",
+                    "remitter", "dr", "cr", "amount",
+                ])
+                recognized_cols = {}
+                unrecognized_cols = {}
+                for col in self.data.columns:
+                    col_lower = col.lower()
+                    if col_lower == "date":
+                        continue  # skip the date column
+                    if any(t in col_lower for t in all_header_terms):
+                        recognized_cols[col] = self.data[col]
+                    else:
+                        unrecognized_cols[col] = self.data[col]
+
+                for unrec_col in list(unrecognized_cols.keys()):
+                    unrec_series = self.data[unrec_col]
+                    unrec_non_null = unrec_series.notna() & (unrec_series != "")
+                    if unrec_non_null.sum() == 0:
+                        # Empty unrecognized column — just drop it
+                        self.data = self.data.drop(columns=[unrec_col])
+                        continue
+                    # Find a recognized column that is complementary
+                    # (non-overlapping data)
+                    for rec_col in list(recognized_cols.keys()):
+                        rec_series = self.data[rec_col]
+                        rec_non_null = rec_series.notna() & (rec_series != "")
+                        # Check complementarity: where one has data, the
+                        # other mostly doesn't
+                        overlap = (unrec_non_null & rec_non_null).sum()
+                        if overlap == 0:
+                            # Perfect complement — merge unrecognized into
+                            # recognized
+                            self.data[rec_col] = rec_series.fillna(unrec_series)
+                            # Also fill empty strings
+                            mask = self.data[rec_col] == ""
+                            self.data.loc[mask, rec_col] = unrec_series[mask]
+                            self.data = self.data.drop(columns=[unrec_col])
+                            logger.info(
+                                f"Merged unrecognized column '{unrec_col}' "
+                                f"into '{rec_col}'"
+                            )
+                            break
                 logger.info(
                     f"Successfully parsed {len(self.all_pages_data)} pages with {len(self.data)} total rows"
                 )
@@ -174,7 +228,7 @@ class Parser:
         self.words_list = words_list
 
     def _find_nearby_headers(
-        self, text_date_object: dict, top_padding: int = 15, bottom_padding: int = 10
+        self, text_date_object: dict, top_padding: int = 25, bottom_padding: int = 10
     ) -> list[dict]:
         words_list: list[dict] = self.words_list
 
@@ -249,6 +303,33 @@ class Parser:
                     logger.debug(f"Table date header found: {table_date}")
 
                     adjacent_headers = self._find_nearby_headers(table_date)
+
+                    # Filter out words from non-header rows that got pulled in
+                    # by top_padding (e.g. title lines above the real headers).
+                    # Bucket words by row (~5px tolerance), keep only rows that
+                    # contain at least one recognised header term.
+                    _header_filter_terms = [
+                        "date", "description", "narration", "particulars",
+                        "details", "chq", "cheque", "withdrawal", "debit",
+                        "credit", "deposit", "amount", "balance", "remarks",
+                        "reference", "mode", "value", "post", "remitter",
+                        "dr", "cr",
+                    ]
+                    _row_buckets: dict[int, list[dict]] = {}
+                    for _w in adjacent_headers:
+                        _rk = round(_w["top"] / 5) * 5
+                        _row_buckets.setdefault(_rk, []).append(_w)
+                    _valid_keys = set()
+                    for _rk, _words in _row_buckets.items():
+                        for _w in _words:
+                            if any(t in _w["text"].lower() for t in _header_filter_terms):
+                                _valid_keys.add(_rk)
+                                break
+                    if _valid_keys:
+                        adjacent_headers = [
+                            _w for _w in adjacent_headers
+                            if round(_w["top"] / 5) * 5 in _valid_keys
+                        ]
                     headers = group_adjacent_text(adjacent_headers, expected_gap=5)
                     padding = self._find_date_header_padding(table_date)
 
@@ -742,12 +823,36 @@ class Parser:
                 rows[row_key] = []
             rows[row_key].append(word)
 
-        for row_key, row_words in rows.items():
+        # Merge adjacent row buckets within 25px to handle multi-row headers
+        # (e.g. test12.pdf has headers split across two rows ~20px apart)
+        # Cap total group span at 35px to avoid chaining summary rows together
+        sorted_keys = sorted(rows.keys())
+        merged_groups = []
+        current_group = []
+        for key in sorted_keys:
+            if not current_group:
+                current_group = [key]
+            elif key - current_group[-1] <= 25 and key - current_group[0] <= 35:
+                current_group.append(key)
+            else:
+                merged_groups.append(current_group)
+                current_group = [key]
+        if current_group:
+            merged_groups.append(current_group)
+
+        for group in merged_groups:
+            group_words = []
+            for key in group:
+                group_words.extend(rows[key])
+
             header_matches = 0
-            for word in row_words:
+            has_date_word = False
+            for word in group_words:
                 word_text = word["text"].lower()
                 if any(term in word_text for term in header_terms):
                     header_matches += 1
+                    if "date" in word_text:
+                        has_date_word = True
                     # Check specifically for date header with typical statement columns
                     if "date" in word_text:
                         potential_date = word
@@ -755,7 +860,9 @@ class Parser:
                             logger.debug(f"Found table date header: {word['text']}")
                             return True
 
-            if header_matches >= 3:
+            # Require both 3+ header terms AND a date word to avoid false positives
+            # from summary sections that repeat 'Balance'/'Deposits'
+            if header_matches >= 3 and has_date_word:
                 logger.debug(f"Found header row with {header_matches} header terms")
                 return True
 
