@@ -39,11 +39,13 @@ class Parser:
         self.date_rows: list[dict] | None = None
         self.last_row_bottom: float | None = None
         self.all_pages_data: list[pd.DataFrame] = []
+        self.page_count: int = 0
 
     def parse(self) -> pd.DataFrame:
         logger.info("Starting to parse the PDF")
         with pdfplumber.open(self.statement) as pdf:
             page_count = len(pdf.pages)
+            self.page_count = page_count
             logger.info(f"PDF has {page_count} pages")
 
             table_start_page = -1
