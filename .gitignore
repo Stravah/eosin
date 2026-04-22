@@ -201,3 +201,15 @@ pyrightconfig.json
 
 
 # End of https://www.toptal.com/developers/gitignore/api/python,pythonvanilla
+
+# Local workspace noise
+.idea/
+.python-version
+.codex
+
+# Modal local state
+.modal/
+
+# Local scaffolding
+main.py
+uv.lock
