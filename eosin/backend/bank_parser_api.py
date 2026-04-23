@@ -56,6 +56,9 @@ def create_app(service: Optional[BankParserService] = None) -> FastAPI:
                 enable_ocr_batching=_env_flag("BANK_PARSER_ENABLE_OCR_BATCHING", impl.ENABLE_OCR_BATCHING),
                 ocr_batch_size=int(os.getenv("BANK_PARSER_OCR_BATCH_SIZE", str(impl.OCR_BATCH_SIZE))),
                 pdf_render_dpi_override=_optional_env_int("BANK_PARSER_PDF_DPI"),
+                layout_max_concurrency=_optional_env_int("BANK_PARSER_LAYOUT_MAX_CONCURRENCY"),
+                ocr_pipeline_workers=_optional_env_int("BANK_PARSER_OCR_PIPELINE_WORKERS"),
+                ocr_pipeline_queue_size=_optional_env_int("BANK_PARSER_OCR_PIPELINE_QUEUE_SIZE"),
                 backend_startup_timeout=_env_float("BANK_PARSER_BACKEND_STARTUP_TIMEOUT", 180.0),
                 backend_retry_interval=_env_float("BANK_PARSER_BACKEND_RETRY_INTERVAL", 5.0),
             )

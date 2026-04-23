@@ -7,18 +7,29 @@ import urllib.request
 from pathlib import Path
 
 import modal
+from dotenv import load_dotenv
 
+load_dotenv()
 
 APP_NAME = os.getenv("EOSIN_MODAL_APP_NAME", "eosin-glm-ocr")
 GPU_TYPE = os.getenv("EOSIN_MODAL_GPU", "A100-80GB")
-MAX_CONTAINERS = int(os.getenv("EOSIN_MODAL_MAX_CONTAINERS", "4"))
-MAX_INPUTS = int(os.getenv("EOSIN_MODAL_MAX_INPUTS", "15"))
+MAX_CONTAINERS = int(os.getenv("EOSIN_MODAL_MAX_CONTAINERS", "1"))
+MAX_INPUTS = int(os.getenv("EOSIN_MODAL_MAX_INPUTS", "32"))
 TARGET_INPUTS = int(os.getenv("EOSIN_MODAL_TARGET_INPUTS", str(MAX_INPUTS)))
 SCALEDOWN_WINDOW_SECONDS = int(os.getenv("EOSIN_MODAL_SCALEDOWN_WINDOW", "300"))
 FUNCTION_TIMEOUT_SECONDS = int(os.getenv("EOSIN_MODAL_TIMEOUT", "1800"))
+MEMORY_MIB = int(os.getenv("EOSIN_MODAL_MEMORY_MIB", "40960"))
 VLLM_PORT = int(os.getenv("EOSIN_MODAL_VLLM_PORT", "8000"))
 VLLM_MODEL = os.getenv("EOSIN_MODAL_VLLM_MODEL", "zai-org/GLM-OCR")
 VLLM_SERVED_MODEL_NAME = os.getenv("EOSIN_MODAL_SERVED_MODEL_NAME", "default")
+VLLM_GPU_MEMORY_UTILIZATION = os.getenv("EOSIN_MODAL_VLLM_GPU_MEMORY_UTILIZATION", "0.90")
+VLLM_MAX_MODEL_LEN = os.getenv("EOSIN_MODAL_VLLM_MAX_MODEL_LEN", "22480")
+VLLM_MAX_NUM_SEQS = os.getenv("EOSIN_MODAL_VLLM_MAX_NUM_SEQS", "192")
+VLLM_MAX_BATCHED_TOKENS = os.getenv("EOSIN_MODAL_VLLM_MAX_BATCHED_TOKENS", "32768")
+VLLM_SPECULATIVE_CONFIG = os.getenv(
+    "EOSIN_MODAL_VLLM_SPECULATIVE_CONFIG",
+    '{"method": "mtp", "num_speculative_tokens": 1}',
+)
 HF_CACHE_PATH = "/root/.cache/huggingface"
 VLLM_HEALTH_URL = f"http://127.0.0.1:{VLLM_PORT}/health"
 
@@ -26,27 +37,37 @@ app = modal.App(APP_NAME)
 hf_cache_volume = modal.Volume.from_name("eosin-hf-cache", create_if_missing=True)
 
 image = (
-    modal.Image.from_registry("vllm/vllm-openai:nightly")
+    modal.Image.from_registry(
+        "vllm/vllm-openai:nightly",
+        setup_dockerfile_commands=["ENTRYPOINT []"],
+    )
     .run_commands(
         "apt-get update && apt-get install -y git ghostscript python3-tk && rm -rf /var/lib/apt/lists/*",
+        "ln -sf $(command -v python3) /usr/local/bin/python",
         "pip install --upgrade pip",
+        "pip install --ignore-installed blinker 'glmocr[selfhosted,server]' pandas beautifulsoup4",
+        "pip install accelerate beautifulsoup4 fastapi numpy opencv-python-headless pandas pillow portalocker pydantic pymupdf python-dotenv python-multipart pyyaml requests sentencepiece tqdm uvicorn eliot 'camelot-py[cv]' liteparse img2table",
     )
-    .pip_install_from_pyproject("pyproject.toml")
     .add_local_dir("eosin", remote_path="/root/eosin", copy=True)
     .run_commands(
         "pip install --upgrade git+https://github.com/huggingface/transformers.git",
     )
+    .entrypoint([])
     .env(
         {
             "PYTHONPATH": "/root",
             "HF_HOME": HF_CACHE_PATH,
+            "LD_LIBRARY_PATH": "/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib:/usr/local/lib/python3.12/dist-packages/nvidia/cuda_nvrtc/lib",
             "GLMOCR_MODE": "selfhosted",
             "GLMOCR_OCR_API_HOST": "127.0.0.1",
             "GLMOCR_OCR_API_PORT": str(VLLM_PORT),
             "GLMOCR_OCR_MODEL": VLLM_SERVED_MODEL_NAME,
             "BANK_PARSER_SAVE_DEBUG_IMAGES": "false",
             "BANK_PARSER_PARSE_TESTING": "false",
-            "BANK_PARSER_OCR_BATCH_SIZE": "25",
+            "BANK_PARSER_ENABLE_OCR_BATCHING": "false",
+            "BANK_PARSER_LAYOUT_MAX_CONCURRENCY": "1",
+            "BANK_PARSER_OCR_PIPELINE_WORKERS": "128",
+            "BANK_PARSER_OCR_PIPELINE_QUEUE_SIZE": "2048",
             "BANK_PARSER_BACKEND_STARTUP_TIMEOUT": "60",
             "BANK_PARSER_BACKEND_RETRY_INTERVAL": "1",
         }
@@ -86,7 +107,7 @@ def _terminate_process(process: subprocess.Popen[str] | None) -> None:
     image=image,
     gpu=GPU_TYPE,
     cpu=12.0,
-    memory=16384,
+    memory=MEMORY_MIB,
     max_containers=MAX_CONTAINERS,
     scaledown_window=SCALEDOWN_WINDOW_SECONDS,
     timeout=FUNCTION_TIMEOUT_SECONDS,
@@ -112,17 +133,18 @@ class BankParserModalApp:
                 str(VLLM_PORT),
                 "--dtype",
                 "bfloat16",
-                "--kv-cache-dtype",
-                "fp8_e4m3",
                 "--trust-remote-code",
                 "--speculative-config",
-                '{"method": "mtp", "num_speculative_tokens": 1}',
+                VLLM_SPECULATIVE_CONFIG,
                 "--max-model-len",
-                "32768",
+                VLLM_MAX_MODEL_LEN,
                 "--gpu-memory-utilization",
-                "0.65",
+                VLLM_GPU_MEMORY_UTILIZATION,
                 "--max-num-seqs",
-                "16",
+                VLLM_MAX_NUM_SEQS,
+                "--max-num-batched-tokens",
+                VLLM_MAX_BATCHED_TOKENS,
+                "--async-scheduling",
                 "--enable-chunked-prefill",
                 "--served-model-name",
                 VLLM_SERVED_MODEL_NAME,
@@ -135,8 +157,10 @@ class BankParserModalApp:
             config_path=str(config_path),
             save_debug_images=False,
             parse_testing=False,
-            enable_ocr_batching=True,
-            ocr_batch_size=25,
+            enable_ocr_batching=False,
+            layout_max_concurrency=1,
+            ocr_pipeline_workers=128,
+            ocr_pipeline_queue_size=2048,
             backend_startup_timeout=60.0,
             backend_retry_interval=1.0,
         )

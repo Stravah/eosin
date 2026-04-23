@@ -1,11 +1,15 @@
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 import pandas as pd
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 try:
     from eliot import log_call
@@ -27,7 +31,7 @@ except ModuleNotFoundError:  # pragma: no cover - standalone fallback
         pass
 
 logger = logging.getLogger(__name__)
-DEFAULT_MODAL_URL = "https://bank-parser--eosin-glm-ocr.modal.run"
+DEFAULT_MODAL_URL = ""
 
 
 def _payload_to_dataframe(payload: dict[str, Any]) -> pd.DataFrame:
@@ -48,6 +52,8 @@ class EosinPDFProvider(Provider):
         timeout: int = 600,
         session: requests.Session | None = None,
         bearer_token: str | None = None,
+        max_attempts: int = 3,
+        retry_backoff_seconds: float = 1.0,
     ) -> None:
         raw_url = (
             base_url
@@ -55,6 +61,10 @@ class EosinPDFProvider(Provider):
             or os.getenv("EOSIN_MODAL_ENDPOINT")
             or DEFAULT_MODAL_URL
         ).rstrip("/")
+        if not raw_url:
+            raise ValueError(
+                "Missing parser base URL. Set EOSIN_PARSER_BASE_URL or EOSIN_MODAL_ENDPOINT."
+            )
         if not raw_url.startswith(("http://", "https://")):
             raw_url = f"https://{raw_url}"
 
@@ -75,6 +85,8 @@ class EosinPDFProvider(Provider):
             or os.getenv("EOSIN_PARSER_BEARER_TOKEN")
             or os.getenv("EOSIN_MODAL_BEARER_TOKEN")
         )
+        self.max_attempts = max(1, int(max_attempts))
+        self.retry_backoff_seconds = max(0.0, float(retry_backoff_seconds))
 
     def _request_headers(self) -> dict[str, str]:
         headers: dict[str, str] = {}
@@ -87,25 +99,42 @@ class EosinPDFProvider(Provider):
         pdf_path = Path(file_path)
         logger.info("EosinPDFProvider: sending %s to %s", pdf_path.name, self.base_url)
 
-        try:
-            with pdf_path.open("rb") as handle:
-                response = self.session.post(
-                    f"{self.base_url}/parse/bank-statement",
-                    files={"file": (pdf_path.name, handle, "application/pdf")},
-                    headers=self._request_headers(),
-                    timeout=self.timeout,
-                )
+        last_exception: Exception | None = None
 
-            response.raise_for_status()
-            payload = response.json()
-            dataframe = _payload_to_dataframe(payload)
-            if dataframe.empty:
-                raise ProviderFailedToDig(f"EosinPDFProvider: No table data extracted from {pdf_path.name}")
-            return dataframe
-        except ProviderFailedToDig:
-            raise
-        except Exception as exc:
-            logger.error("EosinPDFProvider failed for %s: %s", pdf_path.name, exc, exc_info=True)
-            raise ProviderFailedToDig(
-                f"Eosin (remote GLM parser) failed to extract {pdf_path.name}: {exc}"
-            ) from exc
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                with pdf_path.open("rb") as handle:
+                    response = self.session.post(
+                        f"{self.base_url}/parse/bank-statement",
+                        files={"file": (pdf_path.name, handle, "application/pdf")},
+                        headers=self._request_headers(),
+                        timeout=self.timeout,
+                    )
+
+                response.raise_for_status()
+                payload = response.json()
+                dataframe = _payload_to_dataframe(payload)
+                if dataframe.empty:
+                    raise ProviderFailedToDig(f"EosinPDFProvider: No table data extracted from {pdf_path.name}")
+                return dataframe
+            except ProviderFailedToDig:
+                raise
+            except Exception as exc:
+                last_exception = exc
+                is_last_attempt = attempt >= self.max_attempts
+                logger.warning(
+                    "EosinPDFProvider attempt %s/%s failed for %s: %s",
+                    attempt,
+                    self.max_attempts,
+                    pdf_path.name,
+                    exc,
+                    exc_info=is_last_attempt,
+                )
+                if is_last_attempt:
+                    break
+                time.sleep(self.retry_backoff_seconds * attempt)
+
+        assert last_exception is not None
+        raise ProviderFailedToDig(
+            f"Eosin (remote GLM parser) failed to extract {pdf_path.name}: {last_exception}"
+        ) from last_exception

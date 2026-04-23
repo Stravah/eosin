@@ -48,6 +48,9 @@ class BankParserService:
         enable_ocr_batching: Optional[bool] = None,
         ocr_batch_size: Optional[int] = None,
         pdf_render_dpi_override: Optional[int] = None,
+        layout_max_concurrency: Optional[int] = None,
+        ocr_pipeline_workers: Optional[int] = None,
+        ocr_pipeline_queue_size: Optional[int] = None,
         backend_startup_timeout: float = 180.0,
         backend_retry_interval: float = 5.0,
     ):
@@ -66,13 +69,18 @@ class BankParserService:
             self._settings["OCR_BATCH_SIZE"] = ocr_batch_size
         if pdf_render_dpi_override is not None:
             self._settings["PDF_RENDER_DPI_OVERRIDE"] = pdf_render_dpi_override
+        if ocr_pipeline_workers is not None:
+            self._settings["OCR_PIPELINE_WORKERS"] = ocr_pipeline_workers
+        if ocr_pipeline_queue_size is not None:
+            self._settings["OCR_PIPELINE_QUEUE_SIZE"] = ocr_pipeline_queue_size
 
         self._backend_startup_timeout = backend_startup_timeout
         self._backend_retry_interval = backend_retry_interval
-        self._layout_lock = threading.Lock()
+        self._layout_max_concurrency = max(1, int(layout_max_concurrency or 1))
+        self._layout_guard = threading.BoundedSemaphore(self._layout_max_concurrency)
         self._apply_impl_settings()
         self._parser = self._build_parser()
-        self._parser.layout_lock = self._layout_lock
+        self._parser.layout_guard = self._layout_guard
 
     def _apply_impl_settings(self) -> None:
         for name, value in self._settings.items():
@@ -104,6 +112,7 @@ class BankParserService:
         started_at = time.time()
 
         df = self._parser.parse_pdf(str(pdf_path))
+        parser_stats = getattr(self._parser, "last_run_stats", {}) or {}
 
         if not isinstance(df, pd.DataFrame):
             df = pd.DataFrame()
@@ -117,11 +126,24 @@ class BankParserService:
         return BankParserResult(
             source_pdf=pdf_path.name,
             page_count=page_count,
-            pages_with_tables=[],
+            pages_with_tables=[
+                int(page_number)
+                for page_number in parser_stats.get("pages_with_tables", [])
+            ],
             columns=[str(column) for column in df.columns],
             rows=self._json_safe_records(df),
-            timings={"total": round(time.time() - started_at, 3)},
-            debug={},
+            timings={
+                **{
+                    str(name): float(value)
+                    for name, value in parser_stats.get("timings", {}).items()
+                },
+                "service_total": round(time.time() - started_at, 3),
+            },
+            debug={
+                key: value
+                for key, value in parser_stats.items()
+                if key != "timings" and key != "pages_with_tables"
+            },
         )
 
     def parse_pdf_bytes(self, filename: str, pdf_bytes: bytes) -> BankParserResult:

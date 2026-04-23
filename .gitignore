@@ -125,6 +125,8 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+!.env.example
 .venv
 env/
 venv/
@@ -206,6 +208,8 @@ pyrightconfig.json
 .idea/
 .python-version
 .codex
+*.swp
+*.swo
 
 # Modal local state
 .modal/
@@ -213,3 +217,11 @@ pyrightconfig.json
 # Local scaffolding
 main.py
 uv.lock
+/bank statements
+/bank statements/
+/bank_statements/
+/bank-statements/
+/load-test-results/
+/tmp/
+/outputs/
+/debug-images/

@@ -1,6 +1,11 @@
 .codex
+.env
+.env.*
 .git
 .gitignore
+.idea/
+.modal/
+.venv/
 __pycache__/
 *.pyc
 *.pyo
@@ -8,6 +13,13 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+bank statements/
+bank_statements/
+bank-statements/
+load-test-results/
+tmp/
+outputs/
+debug-images/
 build/
 dist/
 htmlcov/

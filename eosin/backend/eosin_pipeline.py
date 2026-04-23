@@ -16,7 +16,7 @@ import os
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, as_completed
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, TypeVar
@@ -36,6 +36,8 @@ ENABLE_OCR_HEADER_FALLBACK = False
 SAVE_DEBUG_IMAGES = False
 ENABLE_OCR_BATCHING = False
 OCR_BATCH_SIZE = 25
+OCR_PIPELINE_WORKERS = None
+OCR_PIPELINE_QUEUE_SIZE = 128
 PDF_RENDER_DPI_OVERRIDE = None
 PDF_RENDER_DPI_AUTO = False
 PDF_RENDER_TARGET_LONG_SIDE_PX = 2600
@@ -59,6 +61,8 @@ from glmocr.dataloader import PageLoader
 from glmocr.layout import PPDocLayoutDetector
 from glmocr.ocr_client import OCRClient
 from glmocr.utils.image_utils import crop_image_region, pdf_to_images_pil
+
+from eosin.backend.ocr_pipeline import OCRPipelineDispatcher, OCRTaskResult
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +506,7 @@ class BankStatementParser:
     def __init__(self, config_path: str | None = None):
         default_config_path = Path(__file__).resolve().parent / "config.yaml"
         self.config_path = str(config_path or default_config_path)
+        self.last_run_stats: Dict[str, object] = {}
 
         print("  Loading SDK config...")
         sdk_cfg = sdk_load_config(self.config_path)
@@ -518,11 +523,19 @@ class BankStatementParser:
         print("  OCR Client ready.")
 
         self.pdf_dpi = sdk_cfg.pipeline.page_loader.pdf_dpi
-        self.layout_lock: threading.Lock | None = None
+        self.layout_guard: threading.Semaphore | None = None
         self.ocr_max_workers = sdk_cfg.pipeline.max_workers
         self.ocr_connection_pool_size = max(
             1,
             getattr(self.ocr_client, "_pool_maxsize", self.ocr_max_workers),
+        )
+        self.ocr_pipeline_workers = self._resolve_ocr_pipeline_workers()
+        self.ocr_pipeline_queue_size = self._resolve_ocr_pipeline_queue_size()
+        self.ocr_dispatcher = OCRPipelineDispatcher(
+            self.page_loader,
+            self.ocr_client,
+            max_workers=self.ocr_pipeline_workers,
+            queue_size=self.ocr_pipeline_queue_size,
         )
 
         if self.ocr_connection_pool_size < self.ocr_max_workers:
@@ -531,8 +544,16 @@ class BankStatementParser:
                 f"({self.ocr_connection_pool_size}) instead of max_workers "
                 f"({self.ocr_max_workers})"
             )
+        print(
+            "  OCR Pipeline ready "
+            f"({self.ocr_pipeline_workers} worker(s), queue size {self.ocr_pipeline_queue_size})."
+        )
 
     def close(self):
+        try:
+            self.ocr_dispatcher.close()
+        except Exception:
+            pass
         try:
             self.layout_detector.stop()
         except Exception:
@@ -553,6 +574,22 @@ class BankStatementParser:
 
     def __exit__(self, *args):
         self.close()
+
+    def _resolve_ocr_pipeline_workers(self) -> int:
+        configured = OCR_PIPELINE_WORKERS
+        if configured is None:
+            configured = self.ocr_max_workers
+        return min(
+            max(1, int(configured)),
+            max(1, int(self.ocr_connection_pool_size)),
+        )
+
+    def _resolve_ocr_pipeline_queue_size(self) -> int:
+        configured = OCR_PIPELINE_QUEUE_SIZE
+        return max(
+            self._resolve_ocr_pipeline_workers(),
+            int(configured),
+        )
 
     def _geometry_driven_pdf_dpi(
         self,
@@ -637,22 +674,25 @@ class BankStatementParser:
     def _select_header_source_table(
         self,
         table_crops: List[Tuple[int, Image.Image]],
-    ) -> Tuple[int, int, Image.Image]:
+    ) -> Tuple[int, int, Image.Image, str]:
         fallback_index = 0
         fallback_height = self._calculate_header_height(table_crops[0][1])
         fallback_image = table_crops[0][1].crop((0, 0, table_crops[0][1].width, fallback_height))
+        fallback_text = ""
 
         for table_index, (page_idx, crop) in enumerate(table_crops):
             header_h = self._calculate_header_height(crop)
             header_img = crop.crop((0, 0, crop.width, header_h))
             header_text = self._ocr_text(header_img)
+            if table_index == 0:
+                fallback_text = header_text
             if self._header_text_looks_like_bank_statement_header(header_text):
                 if table_index > 0:
                     print(
                         f"        → Rejected earlier table(s); using page {page_idx + 1} "
                         "as header source"
                     )
-                return table_index, header_h, header_img
+                return table_index, header_h, header_img, header_text
 
             print(
                 f"        → Header probe page {page_idx + 1}: rejected "
@@ -660,12 +700,12 @@ class BankStatementParser:
             )
 
         print("        → No validated bank-header table found; falling back to first table")
-        return fallback_index, fallback_height, fallback_image
+        return fallback_index, fallback_height, fallback_image, fallback_text
 
     def _run_layout_detection(self, page_images: List[Image.Image]):
         original_batch_size = max(1, int(getattr(self.layout_detector, "batch_size", 1)))
         batch_size = original_batch_size
-        guard = self.layout_lock if self.layout_lock is not None else nullcontext()
+        guard = self.layout_guard if self.layout_guard is not None else nullcontext()
 
         while True:
             try:
@@ -689,33 +729,58 @@ class BankStatementParser:
     def parse_pdf(self, pdf_path: str) -> pd.DataFrame:
         """Parse a bank statement PDF into a single DataFrame."""
         t0 = time.time()
+        step_timings: Dict[str, float] = {}
         effective_dpi = self._effective_pdf_dpi(pdf_path)
 
         print("  [1/8] Rendering PDF pages...")
         print(f"        → Rendering at {effective_dpi} DPI")
+        step_started_at = time.time()
         try:
             page_images = pdf_to_images_pil(pdf_path, dpi=effective_dpi)
         except Exception as e:
             print(f"  ✗ Failed to render PDF: {e}")
+            self.last_run_stats = {
+                "timings": {"render_pages": round(time.time() - step_started_at, 3)},
+                "pages_with_tables": [],
+                "page_count": 0,
+                "effective_dpi": effective_dpi,
+            }
             return pd.DataFrame()
+        step_timings["render_pages"] = round(time.time() - step_started_at, 3)
         print(f"        → {len(page_images)} pages rendered")
 
         if not page_images:
             print("  ✗ No pages found")
+            self.last_run_stats = {
+                "timings": step_timings,
+                "pages_with_tables": [],
+                "page_count": 0,
+                "effective_dpi": effective_dpi,
+            }
             return pd.DataFrame()
 
         print("  [2/8] Running layout detection...")
         t_layout = time.time()
         all_layout_results, _ = self._run_layout_detection(page_images)
-        print(f"        → Done in {time.time() - t_layout:.1f}s")
+        layout_elapsed = time.time() - t_layout
+        step_timings["layout_detection"] = round(layout_elapsed, 3)
+        print(f"        → Done in {layout_elapsed:.1f}s")
 
         print("  [3/8] Identifying main tables...")
+        step_started_at = time.time()
         table_bboxes = self._identify_main_tables(all_layout_results, page_images)
+        step_timings["identify_main_tables"] = round(time.time() - step_started_at, 3)
         pages_with_tables = [i for i, bbox in enumerate(table_bboxes) if bbox is not None]
         print(f"        → Tables on pages: {[p + 1 for p in pages_with_tables]}")
 
         if not pages_with_tables:
             print("  ✗ No tables found in document")
+            self.last_run_stats = {
+                "timings": step_timings,
+                "pages_with_tables": [],
+                "page_count": len(page_images),
+                "effective_dpi": effective_dpi,
+            }
             return pd.DataFrame()
 
         if PARSE_TESTING:
@@ -730,22 +795,28 @@ class BankStatementParser:
             pages_with_tables = selected_pages
 
         print("  [4/8] Cropping table regions...")
+        step_started_at = time.time()
         table_crops: List[Tuple[int, Image.Image]] = []
+        debug_dir: str | None = None
         for page_idx in pages_with_tables:
             crop = crop_image_region(page_images[page_idx], table_bboxes[page_idx])
             table_crops.append((page_idx, crop))
-            if SAVE_DEBUG_IMAGES and page_idx == 7: # Page 8
+            if SAVE_DEBUG_IMAGES and page_idx == 7:  # Page 8
                 debug_dir = os.path.join("output", "debug", os.path.splitext(os.path.basename(pdf_path))[0])
                 os.makedirs(debug_dir, exist_ok=True)
                 crop.save(os.path.join(debug_dir, f"page_{page_idx + 1}_crop.png"))
+        step_timings["crop_table_regions"] = round(time.time() - step_started_at, 3)
 
         # 5. Extract header from first validated table
         print("  [5/8] Computing header height from first table image...")
-        header_source_index, header_h, header_img = self._select_header_source_table(table_crops)
+        step_started_at = time.time()
+        header_source_index, header_h, header_img, header_text = self._select_header_source_table(table_crops)
         if header_source_index > 0:
             table_crops = table_crops[header_source_index:]
 
         first_page_idx, first_crop = table_crops[0]
+        header_tokens = self._header_text_tokens(header_text)
+        step_timings["select_header_source"] = round(time.time() - step_started_at, 3)
 
         if SAVE_DEBUG_IMAGES:
             debug_dir = os.path.join("output", "debug", os.path.splitext(os.path.basename(pdf_path))[0])
@@ -758,7 +829,8 @@ class BankStatementParser:
         print(f"        Header height: {header_h}px (from {first_crop.height}px crop)")
 
         print("  [6/8] Stitching headers onto continuation pages...")
-        skip_header_stitching = self._should_skip_header_stitching(header_img, table_crops)
+        step_started_at = time.time()
+        skip_header_stitching = self._should_skip_header_stitching(header_img, table_crops, header_tokens)
         if skip_header_stitching:
             print("        → Native continuation headers detected confidently; skipping stitch")
         else:
@@ -767,25 +839,29 @@ class BankStatementParser:
         stitched_images: List[Tuple[int, Image.Image]] = []
         for i, (page_idx, crop) in enumerate(table_crops):
             if i == 0:
-                pass  # First page already OCR'd
-            else:
-                stitched = crop if skip_header_stitching else self._stitch_header(header_img, crop)
-                normalized = self._normalize_ocr_image(stitched)
-                stitched_images.append((page_idx, normalized))
-                if SAVE_DEBUG_IMAGES:
-                    normalized.save(os.path.join(debug_dir, f"page_{page_idx + 1}_stitched.png"))
+                continue
+
+            stitched = crop if skip_header_stitching else self._stitch_header(header_img, crop)
+            normalized = self._normalize_ocr_image(stitched)
+            stitched_images.append((page_idx, normalized))
+            if SAVE_DEBUG_IMAGES and debug_dir:
+                normalized.save(os.path.join(debug_dir, f"page_{page_idx + 1}_stitched.png"))
+        step_timings["stitch_headers"] = round(time.time() - step_started_at, 3)
 
         ocr_images: List[Tuple[int, Image.Image]] = [
             (first_page_idx, self._normalize_ocr_image(first_crop))
         ] + stitched_images
 
-        print(f"  [7/8] OCR-ing {len(ocr_images)} table images...")
+        print(f"  [7/8] OCR-ing {len(ocr_images)} table images via shared pipeline...")
         t_ocr = time.time()
-        all_ocr_results = self._ocr_tables_parallel(ocr_images)
-        print(f"        → Done in {time.time() - t_ocr:.1f}s")
+        all_ocr_results, ocr_metrics = self._ocr_tables_parallel(ocr_images)
+        ocr_elapsed = time.time() - t_ocr
+        step_timings["ocr_tables"] = round(ocr_elapsed, 3)
+        print(f"        → Done in {ocr_elapsed:.1f}s")
         all_ocr_results.sort(key=lambda x: x[0])
 
         print("  [8/8] Parsing HTML to DataFrames...")
+        step_started_at = time.time()
         all_dfs: List[pd.DataFrame] = []
         expected_headers: Optional[List[str]] = None
 
@@ -824,6 +900,14 @@ class BankStatementParser:
 
         if not all_dfs:
             print("  ✗ No table data extracted")
+            step_timings["parse_html_tables"] = round(time.time() - step_started_at, 3)
+            self.last_run_stats = {
+                "timings": step_timings,
+                "pages_with_tables": [p + 1 for p in pages_with_tables],
+                "page_count": len(page_images),
+                "effective_dpi": effective_dpi,
+                "ocr_metrics": ocr_metrics,
+            }
             return pd.DataFrame()
 
         combined = pd.concat(all_dfs, ignore_index=True)
@@ -835,8 +919,20 @@ class BankStatementParser:
 
         # Drop columns that are completely empty/NaN
         combined = combined.replace(r'^\s*$', np.nan, regex=True).dropna(axis=1, how='all')
+        step_timings["parse_html_tables"] = round(time.time() - step_started_at, 3)
 
         elapsed = time.time() - t0
+        step_timings["total"] = round(elapsed, 3)
+        self.last_run_stats = {
+            "timings": step_timings,
+            "pages_with_tables": [p + 1 for p in pages_with_tables],
+            "page_count": len(page_images),
+            "effective_dpi": effective_dpi,
+            "ocr_images": len(ocr_images),
+            "header_source_page": first_page_idx + 1,
+            "skip_header_stitching": skip_header_stitching,
+            "ocr_metrics": ocr_metrics,
+        }
         print(f"  → Processed {len(combined)} rows in {elapsed:.1f}s")
         return combined
 
@@ -1106,6 +1202,7 @@ class BankStatementParser:
         self,
         header_img: Image.Image,
         table_crops: List[Tuple[int, Image.Image]],
+        header_tokens: List[str],
     ) -> bool:
         continuation_crops = table_crops[1:]
         if len(continuation_crops) < 2:
@@ -1123,7 +1220,7 @@ class BankStatementParser:
         for probe_index in probe_indices:
             page_idx, crop = continuation_crops[probe_index]
             visual_match = self._has_native_header(header_img, crop)
-            text_match = self._header_text_matches(header_img, crop) if visual_match else False
+            text_match = self._header_text_matches(header_img, crop, header_tokens) if visual_match else False
             has_header = visual_match and text_match
             probe_results.append((page_idx, has_header))
             print(
@@ -1134,23 +1231,22 @@ class BankStatementParser:
         return bool(probe_results) and all(result for _, result in probe_results)
 
     def _ocr_text(self, image: Image.Image) -> str:
-        request = self.page_loader.build_request_from_image(image, task_type="text")
-        response, status_code = self.ocr_client.process(request)
-        if status_code != 200:
+        future = self.ocr_dispatcher.submit(image, task_type="text")
+        result = future.result()
+        if not result.content:
             return ""
-
-        content = (
-            response.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "")
-        )
-        return str(content).strip()
+        return str(result.content).strip()
 
     @staticmethod
     def _header_text_tokens(text: str) -> List[str]:
         return re.findall(r"[a-z0-9]+", text.lower())
 
-    def _header_text_matches(self, header_img: Image.Image, table_crop: Image.Image) -> bool:
+    def _header_text_matches(
+        self,
+        header_img: Image.Image,
+        table_crop: Image.Image,
+        expected_tokens: List[str],
+    ) -> bool:
         candidate_strip = table_crop.crop(
             (0, 0, table_crop.width, min(table_crop.height, header_img.height + 8))
         )
@@ -1160,7 +1256,6 @@ class BankStatementParser:
                 Image.Resampling.LANCZOS,
             )
 
-        expected_tokens = self._header_text_tokens(self._ocr_text(header_img))
         candidate_tokens = self._header_text_tokens(self._ocr_text(candidate_strip))
 
         if not expected_tokens or not candidate_tokens:
@@ -1258,47 +1353,24 @@ class BankStatementParser:
         )
         return image.resize(new_size, Image.Resampling.LANCZOS)
 
-    def _ocr_single(self, image: Image.Image) -> Optional[str]:
-        """Synchronously OCR a single table image."""
-        request = self.page_loader.build_request_from_image(image, task_type="table")
-        response, status_code = self.ocr_client.process(request)
-        if status_code == 200:
-            content = (
-                response.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-            )
-            return content.strip()
-        return None
+    def _submit_ocr_task(self, image: Image.Image, *, task_type: str) -> Future[OCRTaskResult]:
+        return self.ocr_dispatcher.submit(image, task_type=task_type)
 
     def _ocr_tables_parallel(
         self,
         stitched_images: List[Tuple[int, Image.Image]],
-    ) -> List[Tuple[int, Optional[str]]]:
+    ) -> Tuple[List[Tuple[int, Optional[str]]], Dict[str, float]]:
         if not stitched_images:
-            return []
-
-        results: List[Tuple[int, Optional[str]]] = []
-
-        def _ocr_one(page_idx: int, image: Image.Image) -> Tuple[int, Optional[str]]:
-            request = self.page_loader.build_request_from_image(image, task_type="table")
-            response, status_code = self.ocr_client.process(request)
-            if status_code == 200:
-                content = (
-                    response.get("choices", [{}])[0]
-                    .get("message", {})
-                    .get("content", "")
-                )
-                return page_idx, content.strip()
-            else:
-                print(f"        ✗ Page {page_idx + 1}: OCR failed (HTTP {status_code})")
-                return page_idx, None
+            return [], self._empty_ocr_metrics()
 
         batches = (
             chunk_items(stitched_images, OCR_BATCH_SIZE)
             if ENABLE_OCR_BATCHING
             else [list(stitched_images)]
         )
+
+        results: List[Tuple[int, Optional[str]]] = []
+        ocr_task_results: List[OCRTaskResult] = []
 
         for batch_index, batch in enumerate(batches, start=1):
             batch_workers = self._resolve_ocr_batch_workers(len(batch))
@@ -1314,16 +1386,22 @@ class BankStatementParser:
                     f"{batch_workers} worker(s)"
                 )
 
-            with ThreadPoolExecutor(max_workers=batch_workers) as executor:
-                futures = {
-                    executor.submit(_ocr_one, page_idx, img): page_idx
-                    for page_idx, img in batch
-                }
-                for future in as_completed(futures):
-                    results.append(future.result())
+            pending = {
+                self._submit_ocr_task(img, task_type="table"): page_idx
+                for page_idx, img in batch
+            }
+            for future in as_completed(pending):
+                page_idx = pending[future]
+                try:
+                    task_result = future.result()
+                    ocr_task_results.append(task_result)
+                    results.append((page_idx, task_result.content))
+                except Exception as exc:
+                    print(f"        ✗ Page {page_idx + 1}: OCR failed ({exc})")
+                    results.append((page_idx, None))
 
         results.sort(key=lambda x: x[0])
-        return results
+        return results, self._summarize_ocr_metrics(ocr_task_results)
 
     def _resolve_ocr_batch_workers(self, batch_size: int) -> int:
         return min(
@@ -1331,6 +1409,49 @@ class BankStatementParser:
             max(1, self.ocr_max_workers),
             max(1, self.ocr_connection_pool_size),
         )
+
+    @staticmethod
+    def _empty_ocr_metrics() -> Dict[str, float]:
+        return {
+            "task_count": 0,
+            "success_count": 0,
+            "failure_count": 0,
+            "queue_wait_mean": 0.0,
+            "queue_wait_max": 0.0,
+            "build_request_mean": 0.0,
+            "build_request_max": 0.0,
+            "request_mean": 0.0,
+            "request_max": 0.0,
+            "total_mean": 0.0,
+            "total_max": 0.0,
+            "max_queue_size_at_submit": 0.0,
+        }
+
+    def _summarize_ocr_metrics(self, task_results: List[OCRTaskResult]) -> Dict[str, float]:
+        if not task_results:
+            return self._empty_ocr_metrics()
+
+        queue_waits = [item.queue_wait_seconds for item in task_results]
+        build_times = [item.build_request_seconds for item in task_results]
+        request_times = [item.request_seconds for item in task_results]
+        total_times = [item.total_seconds for item in task_results]
+        status_codes = [item.status_code for item in task_results]
+        submitted_queue_sizes = [item.queue_size_at_submit for item in task_results]
+
+        return {
+            "task_count": float(len(task_results)),
+            "success_count": float(sum(1 for code in status_codes if code == 200)),
+            "failure_count": float(sum(1 for code in status_codes if code != 200)),
+            "queue_wait_mean": round(sum(queue_waits) / len(queue_waits), 6),
+            "queue_wait_max": round(max(queue_waits), 6),
+            "build_request_mean": round(sum(build_times) / len(build_times), 6),
+            "build_request_max": round(max(build_times), 6),
+            "request_mean": round(sum(request_times) / len(request_times), 6),
+            "request_max": round(max(request_times), 6),
+            "total_mean": round(sum(total_times) / len(total_times), 6),
+            "total_max": round(max(total_times), 6),
+            "max_queue_size_at_submit": float(max(submitted_queue_sizes)),
+        }
 
     @staticmethod
     def _align_columns_with_headers(
