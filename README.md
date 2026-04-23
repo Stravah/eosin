@@ -9,7 +9,6 @@ Standalone GPU backend for GLM-OCR bank-statement parsing. The primary deploymen
 - `eosin/backend/bank_parser_service.py`: parser lifecycle wrapper.
 - `eosin/backend/eosin_pipeline.py`: PDF preprocessing, layout detection, table stitching, OCR fanout, and result shaping.
 - `eosin/backend/ocr_pipeline.py`: shared OCR work queue that keeps vLLM fed after each PDF finishes preprocessing.
-- `eosin.py`: caller-side provider wrapper for the Almond/thesmos integration.
 - `scripts/load_test_bank_parser.py`: concurrent PDF load tester with JSONL, CSV, and summary reports.
 
 ## Setup
@@ -68,15 +67,15 @@ The default production shape in `.env.example` is:
 
 Modal uses `@modal.concurrent(max_inputs=..., target_inputs=...)`; older `allow_concurrent_inputs` examples are not used by the current SDK.
 
-## Provider Integration
+## Caller Integration
 
-In the caller project, configure the provider endpoint and use `EosinPDFProvider` through the same provider interface:
+Configure the caller project to send PDFs to the deployed parser endpoint:
 
 ```bash
 export EOSIN_PARSER_BASE_URL="https://<workspace>--bank-parser.modal.run"
 ```
 
-Authentication is intentionally not enforced yet. Add it before exposing the endpoint beyond trusted callers.
+The parser accepts `POST /parse/bank-statement` with multipart form field `file`. Authentication is intentionally not enforced yet; add it before exposing the endpoint beyond trusted callers.
 
 ## Load Testing
 

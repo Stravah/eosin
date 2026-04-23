@@ -21,10 +21,8 @@ def test_local_artifacts_are_ignored() -> None:
     assert "!.env.example" in gitignore
 
 
-def test_provider_source_has_modal_url_handling_without_hardcoded_endpoint() -> None:
-    provider_source = Path("eosin.py").read_text()
+def test_readme_does_not_include_hardcoded_modal_endpoint() -> None:
+    readme = Path("README.md").read_text()
 
-    assert 'DEFAULT_MODAL_URL = ""' in provider_source
-    assert 'parsed.netloc.endswith(".modal.run")' in provider_source
-    assert 'os.getenv("BANK_PARSER_PORT", "8090")' in provider_source
-    assert "noelalex" not in provider_source
+    assert "noelalex" not in readme
+    assert "https://<workspace>--bank-parser.modal.run" in readme
