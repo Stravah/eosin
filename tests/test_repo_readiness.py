@@ -21,7 +21,7 @@ def test_env_example_has_modal_defaults() -> None:
     env_example = Path(".env.example").read_text()
 
     assert "EOSIN_MODAL_GPU=A100-80GB" in env_example
-    assert "EOSIN_MODAL_MAX_CONTAINERS=1" in env_example
+    assert "EOSIN_MODAL_MAX_CONTAINERS=3" in env_example
     assert "EOSIN_MODAL_MAX_INPUTS=32" in env_example
     assert "EOSIN_MODAL_MEMORY_MIB=40960" in env_example
     assert "EOSIN_MODAL_VLLM_MAX_BATCHED_TOKENS=32768" in env_example

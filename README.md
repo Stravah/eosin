@@ -55,7 +55,7 @@ The default production shape in `.env.example` is:
 - GPU: `A100-80GB`
 - CPU: `12`
 - Memory: `40960` MiB
-- Modal max containers: `1`
+- Modal max containers: `3`
 - Modal concurrent inputs per container: `32`
 - Idle scaledown window: `300` seconds
 - vLLM model: `zai-org/GLM-OCR`
