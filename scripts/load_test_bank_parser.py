@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+import pandas as pd
 import requests
 from dotenv import load_dotenv
 
@@ -64,14 +65,16 @@ class RequestResult:
     server_ocr_queue_wait_max: float | None
     server_ocr_request_mean: float | None
     server_ocr_request_max: float | None
+    response_json_path: str | None
+    dataframe_markdown_path: str | None
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Hammer the bank parser endpoint with many PDFs.")
     parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT, help="Base URL for the parser service.")
     parser.add_argument("--corpus-dir", default=str(DEFAULT_CORPUS_DIR), help="Directory containing PDF corpus.")
-    parser.add_argument("--target-requests", type=int, default=250, help="Total requests to send.")
-    parser.add_argument("--concurrency", type=int, default=250, help="Client-side concurrent requests.")
+    parser.add_argument("--target-requests", type=int, default=100, help="Total requests to send.")
+    parser.add_argument("--concurrency", type=int, default=32, help="Client-side concurrent requests.")
     parser.add_argument("--timeout", type=int, default=1800, help="Per-request timeout in seconds.")
     parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT), help="Directory for saved reports.")
     return parser.parse_args()
@@ -137,6 +140,36 @@ def make_results_dir(output_root: Path) -> Path:
     return results_dir
 
 
+def safe_artifact_stem(planned: PlannedRequest) -> str:
+    raw = "__".join(
+        [
+            f"{planned.request_index:04d}",
+            planned.bank_name,
+            Path(planned.pdf_path).stem,
+        ]
+    )
+    return "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in raw)[:180]
+
+
+def escape_markdown_cell(value: Any) -> str:
+    text = "" if value is None else str(value)
+    return text.replace("|", "\\|").replace("\n", "<br>")
+
+
+def dataframe_to_markdown(dataframe: pd.DataFrame) -> str:
+    if len(dataframe.columns) == 0:
+        return "_No columns returned._"
+
+    headers = [escape_markdown_cell(column) for column in dataframe.columns]
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for row in dataframe.itertuples(index=False, name=None):
+        lines.append("| " + " | ".join(escape_markdown_cell(value) for value in row) + " |")
+    return "\n".join(lines)
+
+
 def iter_rows(results: Iterable[RequestResult]) -> Iterable[dict[str, Any]]:
     for result in results:
         yield asdict(result)
@@ -146,6 +179,8 @@ def send_request(
     endpoint: str,
     timeout: int,
     corpus_dir: Path,
+    server_responses_dir: Path,
+    dataframes_dir: Path,
     planned: PlannedRequest,
 ) -> RequestResult:
     pdf_path = corpus_dir / planned.pdf_path
@@ -181,11 +216,29 @@ def send_request(
         server_ocr_request_max = None
         error_type = None
         error_message = None
+        response_json_path = None
+        dataframe_markdown_path = None
 
         try:
             payload = response.json()
         except Exception:
             payload = None
+
+        artifact_stem = safe_artifact_stem(planned)
+        response_artifact = server_responses_dir / f"{artifact_stem}.json"
+        response_record: dict[str, Any] = {
+            "request": asdict(planned),
+            "status_code": response.status_code,
+            "ok": response.ok,
+            "latency_seconds": round(latency, 6),
+            "completed_at_utc": isoformat(completed_at),
+            "payload": payload,
+        }
+        if payload is None:
+            response_record["response_text"] = response.text
+        with response_artifact.open("w", encoding="utf-8") as handle:
+            json.dump(response_record, handle, indent=2, ensure_ascii=True)
+        response_json_path = str(response_artifact)
 
         if isinstance(payload, dict):
             rows = payload.get("rows")
@@ -197,6 +250,22 @@ def send_request(
             rows_returned = len(rows) if isinstance(rows, list) else None
             columns_returned = len(columns) if isinstance(columns, list) else None
             pages_with_tables_count = len(pages_with_tables) if isinstance(pages_with_tables, list) else None
+            if response.ok and isinstance(rows, list):
+                dataframe = pd.DataFrame(
+                    rows,
+                    columns=columns if isinstance(columns, list) and columns else None,
+                )
+                markdown_artifact = dataframes_dir / f"{artifact_stem}.md"
+                with markdown_artifact.open("w", encoding="utf-8") as handle:
+                    handle.write(f"# Request {planned.request_index}: {planned.pdf_path}\n\n")
+                    handle.write(f"- Bank: {planned.bank_name}\n")
+                    handle.write(f"- Status: {response.status_code}\n")
+                    handle.write(f"- Latency seconds: {round(latency, 6)}\n")
+                    handle.write(f"- Rows: {len(dataframe)}\n")
+                    handle.write(f"- Columns: {len(dataframe.columns)}\n\n")
+                    handle.write(dataframe_to_markdown(dataframe))
+                    handle.write("\n")
+                dataframe_markdown_path = str(markdown_artifact)
             if isinstance(timings, dict):
                 server_total_seconds = timings.get("total")
                 server_render_seconds = timings.get("render_pages")
@@ -245,6 +314,8 @@ def send_request(
             server_ocr_queue_wait_max=server_ocr_queue_wait_max if isinstance(server_ocr_queue_wait_max, (int, float)) else None,
             server_ocr_request_mean=server_ocr_request_mean if isinstance(server_ocr_request_mean, (int, float)) else None,
             server_ocr_request_max=server_ocr_request_max if isinstance(server_ocr_request_max, (int, float)) else None,
+            response_json_path=response_json_path,
+            dataframe_markdown_path=dataframe_markdown_path,
         )
     except Exception as exc:
         completed_at = utc_now()
@@ -277,6 +348,8 @@ def send_request(
             server_ocr_queue_wait_max=None,
             server_ocr_request_mean=None,
             server_ocr_request_max=None,
+            response_json_path=None,
+            dataframe_markdown_path=None,
         )
 
 
@@ -353,6 +426,8 @@ def summarize_results(
         "rows_returned_total": rows_total,
         "bytes_uploaded_total": bytes_uploaded_total,
         "bytes_downloaded_total": bytes_downloaded_total,
+        "server_responses_dir": None,
+        "dataframes_dir": None,
         "latency_seconds": {
             "min": min(latencies) if latencies else None,
             "max": max(latencies) if latencies else None,
@@ -440,6 +515,8 @@ def write_results(results_dir: Path, plan: list[PlannedRequest], results: list[R
         f"Rows returned total: {summary['rows_returned_total']}",
         f"Bytes uploaded total: {summary['bytes_uploaded_total']}",
         f"Bytes downloaded total: {summary['bytes_downloaded_total']}",
+        f"Server responses dir: {summary['server_responses_dir']}",
+        f"DataFrames dir: {summary['dataframes_dir']}",
         f"Git branch: {summary['git']['branch']}",
         f"Git commit: {summary['git']['commit']}",
     ]
@@ -464,6 +541,10 @@ def main() -> None:
     plan = build_request_plan(corpus_dir, pdf_paths, args.target_requests)
     output_root = Path(args.output_root)
     results_dir = make_results_dir(output_root)
+    server_responses_dir = results_dir / "server-responses"
+    dataframes_dir = results_dir / "dataframes"
+    server_responses_dir.mkdir(parents=True, exist_ok=True)
+    dataframes_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Endpoint: {endpoint}")
     print(f"Corpus dir: {corpus_dir}")
@@ -479,7 +560,15 @@ def main() -> None:
 
     with ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as executor:
         future_map = {
-            executor.submit(send_request, endpoint, args.timeout, corpus_dir, planned): planned
+            executor.submit(
+                send_request,
+                endpoint,
+                args.timeout,
+                corpus_dir,
+                server_responses_dir,
+                dataframes_dir,
+                planned,
+            ): planned
             for planned in plan
         }
         for future in as_completed(future_map):
@@ -505,6 +594,8 @@ def main() -> None:
         concurrency=args.concurrency,
         timeout=args.timeout,
     )
+    summary["server_responses_dir"] = str(server_responses_dir)
+    summary["dataframes_dir"] = str(dataframes_dir)
     write_results(results_dir, plan, results, summary)
 
     print("Summary:")

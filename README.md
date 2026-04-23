@@ -98,14 +98,16 @@ Run a heavier sweep:
 python scripts/load_test_bank_parser.py \
   --endpoint "$EOSIN_PARSER_BASE_URL" \
   --corpus-dir "bank statements" \
-  --target-requests 250 \
-  --concurrency 64 \
+  --target-requests 100 \
+  --concurrency 32 \
   --timeout 1800
 ```
 
 Reports are written to `load-test-results/<timestamp>/` and include:
 
 - request-level JSONL and CSV logs
+- raw server responses under `server-responses/`
+- parsed pandas DataFrame markdown files under `dataframes/`
 - success and failure counts
 - latency percentiles
 - throughput
