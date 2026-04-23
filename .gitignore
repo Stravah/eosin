@@ -125,6 +125,8 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+!.env.example
 .venv
 env/
 venv/
@@ -201,3 +203,25 @@ pyrightconfig.json
 
 
 # End of https://www.toptal.com/developers/gitignore/api/python,pythonvanilla
+
+# Local workspace noise
+.idea/
+.python-version
+.codex
+*.swp
+*.swo
+
+# Modal local state
+.modal/
+
+# Local scaffolding
+main.py
+uv.lock
+/bank statements
+/bank statements/
+/bank_statements/
+/bank-statements/
+/load-test-results/
+/tmp/
+/outputs/
+/debug-images/
