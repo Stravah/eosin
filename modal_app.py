@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 APP_NAME = os.getenv("EOSIN_MODAL_APP_NAME", "eosin-glm-ocr")
+WEB_LABEL = os.getenv("EOSIN_MODAL_WEB_LABEL", "bank-parser")
 GPU_TYPE = os.getenv("EOSIN_MODAL_GPU", "A100-80GB")
 MAX_CONTAINERS = int(os.getenv("EOSIN_MODAL_MAX_CONTAINERS", "3"))
 MAX_INPUTS = int(os.getenv("EOSIN_MODAL_MAX_INPUTS", "32"))
@@ -30,11 +31,12 @@ VLLM_SPECULATIVE_CONFIG = os.getenv(
     "EOSIN_MODAL_VLLM_SPECULATIVE_CONFIG",
     '{"method": "mtp", "num_speculative_tokens": 1}',
 )
+HF_CACHE_VOLUME_NAME = os.getenv("EOSIN_MODAL_HF_CACHE_VOLUME", "eosin-hf-cache")
 HF_CACHE_PATH = "/root/.cache/huggingface"
 VLLM_HEALTH_URL = f"http://127.0.0.1:{VLLM_PORT}/health"
 
 app = modal.App(APP_NAME)
-hf_cache_volume = modal.Volume.from_name("eosin-hf-cache", create_if_missing=True)
+hf_cache_volume = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing=True)
 
 image = (
     modal.Image.from_registry(
@@ -174,6 +176,6 @@ class BankParserModalApp:
 
         _terminate_process(getattr(self, "vllm_process", None))
 
-    @modal.asgi_app(label="bank-parser")
+    @modal.asgi_app(label=WEB_LABEL)
     def web(self):
         return self.web_app

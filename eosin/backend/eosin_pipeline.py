@@ -227,7 +227,7 @@ DATE_ATOM_RE = (
     r"(?:"
     r"\d{1,2}[-/]\d{1,2}[-/]\d{2,4}"
     r"|"
-    r"\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}"
+    r"\d{1,2}\s+[A-Za-z]{3,9}\s+[']?\d{2,4}"
     r"|"
     r"\d{1,2}[-/][A-Za-z]{3,9}[-/]\d{2,4}"
     r")"
@@ -488,6 +488,68 @@ def parse_html_table(
         cols = [f"col_{i}" for i in range(ncols)]
 
     return pd.DataFrame(normalized_rows, columns=make_columns_unique(cols))
+
+
+def _score_table_candidate(
+    df: pd.DataFrame,
+    raw_headers: List[str],
+    expected_headers: Optional[List[str]],
+) -> int:
+    if df.empty:
+        return -1
+
+    score = 0
+    cleaned_headers = [header.strip() for header in raw_headers if header and header.strip()]
+    header_text = " ".join(cleaned_headers).lower()
+
+    if cleaned_headers:
+        score += 20
+        score += sum(1 for kw in HEADER_KEYWORDS if kw in header_text) * 10
+
+    date_hits = 0
+    if expected_headers:
+        expected = {header.strip().lower() for header in expected_headers if header.strip()}
+        actual = {str(column).strip().lower() for column in df.columns if str(column).strip()}
+        raw = {header.strip().lower() for header in cleaned_headers}
+        score += len(expected & actual) * 15
+        score += len(expected & raw) * 20
+        if len(df.columns) == len(expected_headers):
+            score += 10
+        if raw and not (expected & raw):
+            score -= 40
+
+    for column in df.columns:
+        values = df[column].fillna("").astype(str).str.strip()
+        date_hits = max(date_hits, int(values.apply(is_date_like).sum()))
+    score += min(date_hits, 10) * 8
+    if expected_headers and date_hits == 0:
+        score -= 20
+
+    non_empty_cells = int(
+        df.fillna("").astype(str).apply(lambda column: column.str.strip().ne("")).sum().sum()
+    )
+    score += min(non_empty_cells, 100)
+    score += min(len(df), 50) * 4
+    return score
+
+
+def select_best_table_candidate(
+    table_htmls: Sequence[str],
+    expected_headers: Optional[List[str]] = None,
+) -> Optional[Tuple[int, str, pd.DataFrame, List[str]]]:
+    best_candidate: Optional[Tuple[int, str, pd.DataFrame, List[str], int]] = None
+
+    for index, table_html in enumerate(table_htmls):
+        raw_headers = extract_headers_from_html(table_html)
+        parsed_df = parse_html_table(table_html, expected_headers=expected_headers)
+        score = _score_table_candidate(parsed_df, raw_headers, expected_headers)
+        if best_candidate is None or score > best_candidate[4]:
+            best_candidate = (index, table_html, parsed_df, raw_headers, score)
+
+    if best_candidate is None or best_candidate[4] < 0:
+        return None
+
+    return best_candidate[:4]
 
 
 # ---------------------------------------------------------------------------
@@ -881,10 +943,22 @@ class BankStatementParser:
                 print(f"        Page {page_idx + 1}: No <table> found in response")
                 continue
 
-            table_html = table_htmls[0]
+            selected_table = select_best_table_candidate(
+                table_htmls,
+                expected_headers=expected_headers,
+            )
+            if selected_table is None:
+                print(f"        Page {page_idx + 1}: No usable table found in response")
+                continue
+
+            table_index, table_html, df, raw_headers = selected_table
+            if table_index > 0:
+                print(
+                    f"        Page {page_idx + 1}: selected table "
+                    f"{table_index + 1}/{len(table_htmls)}"
+                )
 
             if expected_headers is None:
-                raw_headers = extract_headers_from_html(table_html)
                 if raw_headers:
                     expected_headers = raw_headers
                     print(f"        Headers: {expected_headers}")
@@ -893,7 +967,7 @@ class BankStatementParser:
                         for existing_df in all_dfs
                     ]
 
-            df = parse_html_table(table_html, expected_headers=expected_headers)
+            df = self._align_columns_with_headers(df, expected_headers or [])
             if not df.empty:
                 all_dfs.append(df)
                 print(f"        Page {page_idx + 1}: {len(df)} rows")
@@ -1590,7 +1664,7 @@ class BankStatementParser:
                     previous[column] = f"{previous_value} {current_value}".strip()
 
         if not merged_rows:
-            return df.iloc[0:0]
+            return df
 
         return pd.DataFrame(merged_rows, columns=df.columns)
 
@@ -1603,6 +1677,12 @@ class BankStatementParser:
             return df
 
         mask = df[date_column].fillna("").astype(str).str.strip().apply(is_date_like)
+        
+        # Avoid dropping ALL rows if date detection completely failed
+        if mask.sum() == 0:
+            print("  Warning: No rows had a valid date. Skipping date filtering.")
+            return df
+
         removed = int((~mask).sum())
         if removed > 0:
             print(f"  Removed {removed} row(s) without a valid date")
