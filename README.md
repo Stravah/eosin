@@ -138,6 +138,9 @@ curl -sS http://localhost:8090/health
 - OCR work is queued after preprocessing and vLLM handles batching/concurrency.
 - Hugging Face cache is persisted in the Modal volume `eosin-hf-cache`.
 - `BANK_PARSER_ENABLE_OCR_BATCHING=false` because batching is delegated to vLLM.
+- The vLLM image must have a valid installed `transformers` distribution; vLLM
+  reads the package version from `importlib.metadata` during startup and will
+  fail health checks if that metadata is broken.
 
 ## Observability TODO
 

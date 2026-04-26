@@ -49,11 +49,10 @@ image = (
         "pip install --upgrade pip",
         "pip install --ignore-installed blinker 'glmocr[selfhosted,server]' pandas beautifulsoup4",
         "pip install accelerate beautifulsoup4 fastapi numpy opencv-python-headless pandas pillow portalocker pydantic pymupdf python-dotenv python-multipart pyyaml requests sentencepiece tqdm uvicorn eliot 'camelot-py[cv]' liteparse img2table",
+        "pip install --no-cache-dir --ignore-installed 'huggingface-hub==1.4.1' 'transformers==5.3.0'",
+        "python -c \"from importlib.metadata import version; import transformers, huggingface_hub; print('transformers', transformers.__version__); print('dist-version', version('transformers')); print('huggingface-hub', huggingface_hub.__version__); print('hub-dist-version', version('huggingface-hub'))\"",
     )
     .add_local_dir("eosin", remote_path="/root/eosin", copy=True)
-    .run_commands(
-        "pip install --upgrade git+https://github.com/huggingface/transformers.git",
-    )
     .entrypoint([])
     .env(
         {
@@ -67,6 +66,7 @@ image = (
             "BANK_PARSER_SAVE_DEBUG_IMAGES": "false",
             "BANK_PARSER_PARSE_TESTING": "false",
             "BANK_PARSER_ENABLE_OCR_BATCHING": "false",
+            "BANK_PARSER_LAYOUT_MODE": "auto",
             "BANK_PARSER_LAYOUT_MAX_CONCURRENCY": "1",
             "BANK_PARSER_OCR_PIPELINE_WORKERS": "128",
             "BANK_PARSER_OCR_PIPELINE_QUEUE_SIZE": "2048",

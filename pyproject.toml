@@ -28,6 +28,8 @@ dependencies = [
     "requests",
     "sentencepiece",
     "torch",
+    "huggingface-hub==1.4.1",
+    "transformers==5.3.0",
     "tqdm",
     "uvicorn",
 ]

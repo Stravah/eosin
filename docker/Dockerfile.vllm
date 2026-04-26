@@ -1,10 +1,13 @@
 # Use the official vLLM nightly image which has all CUDA dev tools baked in
 FROM vllm/vllm-openai:nightly
 
-# Upgrade transformers to the bleeding edge, as requested
+# Install a clean transformers wheel with valid dist metadata. vLLM reads the
+# package version through importlib.metadata during startup, and broken metadata
+# will crash the server before it becomes healthy.
 RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 RUN pip install --upgrade pip
-RUN pip install --upgrade git+https://github.com/huggingface/transformers.git
+RUN pip install --no-cache-dir --ignore-installed "huggingface-hub==1.4.1" "transformers==5.3.0"
+RUN python3 -c "from importlib.metadata import version; import transformers, huggingface_hub; print(transformers.__version__); print(version('transformers')); print(huggingface_hub.__version__); print(version('huggingface-hub'))"
 
 WORKDIR /app
 EXPOSE 8080
