@@ -31,9 +31,9 @@ services:
       - "--speculative-config"
       - '{"method": "mtp", "num_speculative_tokens": 1}'
       - "--max-model-len"
-      - "32768"
+      - "8192"
       - "--gpu-memory-utilization"
-      - "0.65"
+      - "0.45"
       - "--max-num-seqs"
       - "16"
       - "--enable-chunked-prefill"

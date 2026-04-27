@@ -8,5 +8,21 @@ COPY eosin /app/eosin
 ENV LD_LIBRARY_PATH="/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib:/usr/local/lib/python3.12/dist-packages/nvidia/cuda_nvrtc/lib:$LD_LIBRARY_PATH"
 RUN pip install --ignore-installed blinker && pip install .
 
+# Patch glmocr layout_detector.py to use Auto* classes with trust_remote_code
+# (fixes ImportError: cannot import PPDocLayoutV3ImageProcessor from transformers)
+RUN python3 -c "\
+path = '/usr/local/lib/python3.12/dist-packages/glmocr/layout/layout_detector.py'; \
+f = open(path, 'r'); content = f.read(); f.close(); \
+content = content.replace( \
+    'from transformers import (\n    PPDocLayoutV3ForObjectDetection,\n    PPDocLayoutV3ImageProcessor,\n)', \
+    'from transformers import AutoImageProcessor, AutoModelForObjectDetection' \
+); \
+content = content.replace( \
+    'self._image_processor = PPDocLayoutV3ImageProcessor.from_pretrained(\n            self.model_dir\n        )\n        self._model = PPDocLayoutV3ForObjectDetection.from_pretrained(self.model_dir)', \
+    'self._image_processor = AutoImageProcessor.from_pretrained(\n            self.model_dir, trust_remote_code=True\n        )\n        self._model = AutoModelForObjectDetection.from_pretrained(self.model_dir, trust_remote_code=True)' \
+); \
+f = open(path, 'w'); f.write(content); f.close(); \
+print('Patched glmocr layout_detector.py')"
+
 EXPOSE 8090
 ENTRYPOINT ["uvicorn", "eosin.backend.bank_parser_api:app", "--host", "0.0.0.0", "--port", "8090"]
